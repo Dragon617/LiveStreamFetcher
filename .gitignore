@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+venv/
+env/
+.env
+
+# 日志和临时文件
+*.log
+_test_out.txt
+_test_err.txt
+build_log*.txt
+build_output*.txt
+build_protected_stdout.txt
+build_protected_stderr.txt
+pyi_error.txt
+pyi_normal_v515.txt
+pyarmor.bug.log
+
+# PyInstaller 构建产物
+build/
+dist/
+dist_obfuscated/
+build_protected/
+*.spec.bak
+
+# EXE 可执行文件
+*.exe
+
+# DLL 动态库
+*.dll
+*.sys
+
+# 测试数据和调试文件
+test_fragment.flv
+debug_xhs_responses.json
+xhs_raw_state.json
+test_visitor.png
+
+# WorkBuddy 内部配置（不推送到公开仓库）
+.workbuddy/
+
+# 微信视频下载工具（子仓库/二进制工具，单独管理）
+wechatVideoDownload_ref/
+wechatVideoDownload2.6/
+wechatVideoDownload2.6.zip
+
+# ZIP 压缩包
+*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
