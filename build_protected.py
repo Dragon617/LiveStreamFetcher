@@ -337,6 +337,9 @@ datas = [
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     (r'C:\Users\15346\WorkBuddy\20260408125205\wechatVideoDownload2.6\微信视频号下载工具2.6.exe', 'wechat_video_tool'),
     (r'C:\Users\15346\WorkBuddy\20260408125205\wechatVideoDownload2.6\缓存', 'wechat_video_tool'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\影视匠金色渐变LOGO.png', '.'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\app_icon.ico', '.'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\icons', 'icons'),
 ]
 hiddenimports = [
     '_threading_local',
@@ -352,6 +355,8 @@ hiddenimports = [
     'requests', 'requests.adapters', 'requests.cookies', 'requests.utils',
     'urllib3', 'certifi', 'charset_normalizer', 'idna',
     'winreg',
+    'PIL', 'PIL.Image', 'PIL.ImageTk', 'PIL._tkinter_finder',
+    'io',
 ]
 datas += collect_data_files('yt_dlp')
 datas += collect_data_files('certifi')
@@ -381,7 +386,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v6.3',
+    name='LiveStreamFetcher_v7.6.39',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -409,6 +414,9 @@ datas = [
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     (r'C:\Users\15346\WorkBuddy\20260408125205\wechatVideoDownload2.6\微信视频号下载工具2.6.exe', 'wechat_video_tool'),
     (r'C:\Users\15346\WorkBuddy\20260408125205\wechatVideoDownload2.6\缓存', 'wechat_video_tool'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\影视匠金色渐变LOGO.png', '.'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\app_icon.ico', '.'),
+    (r'C:\Users\15346\WorkBuddy\20260408125205\icons', 'icons'),
 ]
 hiddenimports = [
     '_threading_local',
@@ -424,6 +432,8 @@ hiddenimports = [
     'requests', 'requests.adapters', 'requests.cookies', 'requests.utils',
     'urllib3', 'certifi', 'charset_normalizer', 'idna',
     'winreg',
+    'PIL', 'PIL.Image', 'PIL.ImageTk', 'PIL._tkinter_finder',
+    'io',
 ]
 datas += collect_data_files('yt_dlp')
 datas += collect_data_files('certifi')
@@ -452,7 +462,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v6.3_plain',
+    name='LiveStreamFetcher_v7.6.39_plain',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -508,12 +518,12 @@ def build_plain():
                 print(f"      ERR: {line[:200]}")
         return None
 
-    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v6.3_plain.exe")
+    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v7.6.39_plain.exe")
     if os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
         print(f"      未加密版打包成功: {size_mb:.1f} MB")
         # 复制到项目 dist 目录
-        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v6.3_plain.exe")
+        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v7.6.39_plain.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)
@@ -615,13 +625,13 @@ def main():
         size_plain = os.path.getsize(plain_path) / (1024 * 1024)
         print(f"  [A] 未加密版: {plain_path} ({size_plain:.1f} MB)")
 
-    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v6.3.exe")
+    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v7.6.39.exe")
     protected_ok = False
     if os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
         print(f"  [B] 加密版:   {output_exe} ({size_mb:.1f} MB)")
         # 复制到项目 dist 目录
-        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v6.3.exe")
+        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v7.6.39.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)

@@ -44,7 +44,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v6.2',
+    name='LiveStreamFetcher_v7.6.39',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
