@@ -4311,14 +4311,13 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                               wait_timeout: float = 30.0) -> tuple:
     """用对应平台的嵌入式 Chromium 浏览器打开 URL（与解析时的浏览器共享 cookie）。
 
-    v8.3.8 重大改进：所有 5 个平台共用**同一个** chrome.exe 浏览器进程 + 单 CDP 端口
-    （9222）+ 单 user-data-dir。每个平台以**新 tab** 形式加入同一个浏览器窗口。
-    cookie 按 URL 域名自动隔离（不同平台不同域）。
-
-    v8.3.7 之前是每个平台独立 chrome.exe → 5 个窗口（用户反馈太多）
-    v8.3.5 之前是 Playwright launch_persistent_context → GUI 不显示
-    v8.3.4 之前是 daemon thread 提前退出 → 闪退
-    v8.3.1 之前是 with sync_playwright() 上下文 → 启动后立刻关闭
+    v8.4.4 根本性修复：放弃 subprocess + CDP 方案，改回 Playwright
+    `launch_persistent_context`（v8.3.0 之前用）。原因：
+    - subprocess + CDP 方案下，chrome 在 CDP 控制 + `--no-sandbox` flag 下渲染
+      异常——用户点抖音页面里 `target="_blank"` 链接，chrome 创建的新 tab 卡在
+      about:blank，且老页面 CSS 错位（搜索图标、抖音 logo 重叠）。
+    - Playwright `launch_persistent_context` 让 chrome 用默认配置启动，无 CDP
+      干扰，chrome 原生行为正常（点击链接开新 tab 加载）。
 
     Returns:
         (ok: bool, error_msg: str)
@@ -4328,24 +4327,18 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     if platform_key not in _PLATFORM_BROWSER_MAP:
         return False, f"不支持的平台: {platform_key}"
 
-    # v8.3.8: 已有共享浏览器 → 在同一窗口新开（不重启窗口、不 taskkill）
-    # v8.4.3: 改回同步路径（主线程等 goto），错误透传到 UI。
-    # 之前 daemon thread 异步 + silent except → 用户看到 about:blank 假成功，
-    # 实际 goto 失败（被 except 吞掉）。同步路径 chrome 已运行情况下 goto 通常 1-3 秒。
+    # v8.4.4: 复用 session：用 BrowserContext.new_page() 创建新 tab + goto
     if _SHARED_BROWSER_SESSION is not None:
         try:
-            _, browser, _, _ = _SHARED_BROWSER_SESSION
-            context = browser.contexts[0]
+            _, context, _, _ = _SHARED_BROWSER_SESSION
             page = context.new_page()
+            page.set_default_navigation_timeout(20000)
             try:
-                page.set_default_navigation_timeout(20000)
                 page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
             except Exception as e1:
                 try:
-                    # fallback 到 commit（最快响应）
                     page.goto(target_url, wait_until="commit", timeout=15000)
                 except Exception as e2:
-                    # 两次都失败：关闭残留 about:blank tab，返回错误
                     try:
                         page.close()
                     except Exception:
@@ -4353,126 +4346,81 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                     return False, f"goto 失败: domcontentloaded={e1}, commit={e2}"
             return True, ""
         except Exception as e:
-            return False, f"新开 tab 失败: {e}"
+            print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
+            _SHARED_BROWSER_SESSION = None
 
-    # v8.3.8: 启动共享 chrome.exe（5 个平台共用）
-    port = _CDP_PORT_SHARED
-
+    # v8.4.4: 用 Playwright launch_persistent_context（Playwright 完整管理 chrome）
     # chrome.exe 路径
     browser_path = _ensure_chromium_ready()
     if not browser_path:
         return False, "chromium 未找到，请确认内嵌 chromium 已打包"
-    chrome_exe = os.path.join(browser_path, "chrome.exe")
-    if not os.path.isfile(chrome_exe):
-        return False, f"chrome.exe 不存在: {chrome_exe}"
 
     # 共享 data_dir（所有平台 cookie 都存在这里，Chrome 按 URL 域名隔离）
     data_dir = _get_app_cache_dir("shared_browser_data")
 
-    # 检查端口是否被占用（残留 chrome.exe），被占用则 taskkill 释放
-    import socket as _socket
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    port_in_use = sock.connect_ex(("127.0.0.1", port)) == 0
-    sock.close()
-    if port_in_use:
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/FI", f"TCP PORT EQ {port}", "/T"],
-                capture_output=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
-        import time as _time
-        _time.sleep(1.5)
-
     # 强制解锁 data_dir（防 SingletonLock 残留）
     _force_unlock_chromium_dir(data_dir)
 
-    # 启动 chrome.exe（单进程，5 个平台共用）
-    # v8.3.10: 不要 --no-startup-window（否则 chrome 不开窗口导致用户看不到）。
-    #           带 target_url 作为初始 tab，CDP 接管后**复用初始 tab**（避免双 tab）。
-    # v8.4.1: 去掉 --no-sandbox（chrome 145+ 标记为不支持命令行标记，触发警告条）。
-    # v8.4.2: 加回 --no-sandbox（默认 sandbox 在某些 Windows 环境启动失败）。
-    # v8.4.3: 简化 cmd，移除 --disable-blink-features=AutomationControlled
-    #           （之前为了抖音反爬保留，但可能干扰 chrome 渲染，导致新 tab 加载异常
-    #           或老页面 CSS 错位）。chrome 默认 webdriver=true 对抖音风控影响有限。
-    cmd = [
-        chrome_exe,
-        f"--user-data-dir={data_dir}",
-        f"--remote-debugging-port={port}",
-        "--remote-debugging-address=127.0.0.1",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-sandbox",
-        target_url,
-    ]
-    creation_flags = 0
-    if sys.platform == 'win32':
-        creation_flags = 0x08000000  # CREATE_NO_WINDOW
-    try:
-        chrome_proc = subprocess.Popen(
-            cmd,
-            cwd=browser_path,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-        )
-    except Exception as e:
-        return False, f"启动 chrome.exe 失败: {e}"
+    # 抑制 Playwright 子进程弹出 CMD 黑窗口
+    if sys.platform == "win32":
+        _orig_popen = subprocess.Popen
+        def _no_console_popen(*args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+            return _orig_popen(*args, **kwargs)
+        subprocess.Popen = _no_console_popen
 
-    # 同步等待 CDP 连接（最多 wait_timeout 秒）
-    import time as _time
+    # 同步等待启动结果（Playwright launch_persistent_context 启动要 5-15 秒）
     import threading as _threading
     ready_event = _threading.Event()
-    result = {"ok": False, "error": "未启动"}
+    result = {"ok": False, "error": "未启动", "p": None, "context": None}
 
-    def _connect():
+    def _launch():
         try:
             from playwright.sync_api import sync_playwright
             p = sync_playwright().start()
-            browser = None
-            for _attempt in range(int(wait_timeout)):
-                try:
-                    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-                    if browser:
-                        break
-                except Exception:
-                    pass
-                _time.sleep(1)
-
-            if not browser:
-                p.stop()
-                try: chrome_proc.terminate()
-                except Exception: pass
-                result["error"] = f"CDP 连接超时（端口 {port}）"
-                ready_event.set()
-                return
-
-            context = browser.contexts[0]
-            # v8.3.10: 不要 new_page（chrome 启动时已开初始 tab 显示 target_url）。
-            #           复用初始 tab，避免双 tab。
+            # launch_persistent_context：Playwright 用自家 driver 启动 chrome
+            # 不用 subprocess.Popen + CDP，避免 CDP 干扰 chrome 原生 tab 行为
+            # v8.4.5: launch_persistent_context 不允许 args 里带 URL（"Arguments can
+            # not specify page to be opened"）。先启动 chrome，复用初始 New Tab Page
+            # 用 pages[0].goto(target_url) 跳转，避免双 tab。
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=data_dir,
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+                ignore_default_args=["--no-sandbox"],
+                timeout=30000,
+            )
+            # 复用 chrome 启动时的初始 New Tab Page（只有一个 tab）
             pages = context.pages
             if pages:
-                # 异步等初始 tab 加载完成（不阻塞主线程）
-                def _wait_initial():
+                try:
+                    pages[0].goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e1:
                     try:
-                        pages[0].wait_for_load_state("domcontentloaded", timeout=30000)
+                        pages[0].goto(target_url, wait_until="commit", timeout=15000)
                     except Exception:
                         pass
-                _threading.Thread(target=_wait_initial, daemon=True).start()
-
-            _PLATFORM_BROWSER_RUNNERS.append((p, browser))
-            _SHARED_BROWSER_SESSION = (p, browser, chrome_proc, port)
+                try:
+                    pages[0].wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+            _PLATFORM_BROWSER_RUNNERS.append((p, context))
+            _SHARED_BROWSER_SESSION = (p, context, None, 0)
             result["ok"] = True
             result["error"] = ""
+            result["p"] = p
+            result["context"] = context
             ready_event.set()
         except Exception as e:
             result["error"] = str(e)[:200]
             ready_event.set()
 
-    _threading.Thread(target=_connect, daemon=True).start()
+    _threading.Thread(target=_launch, daemon=True).start()
 
     if ready_event.wait(timeout=wait_timeout + 5):
         return result["ok"], result["error"]
