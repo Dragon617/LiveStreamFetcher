@@ -4329,19 +4329,28 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         return False, f"不支持的平台: {platform_key}"
 
     # v8.3.8: 已有共享浏览器 → 在同一窗口新开（不重启窗口、不 taskkill）
+    # v8.3.9: new_page + goto 放进 daemon thread，主线程立即返回（流畅）
     if _SHARED_BROWSER_SESSION is not None:
         try:
-            _, browser, _, port = _SHARED_BROWSER_SESSION
+            _, browser, _, _ = _SHARED_BROWSER_SESSION
             context = browser.contexts[0]
-            page = context.new_page()
-            try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
+
+            def _async_new_tab():
                 try:
-                    page.goto(target_url, wait_until="commit", timeout=15000)
-                except Exception:
-                    pass
-            print(f"[{platform_key}] 复用浏览器窗口，新开 tab")
+                    page = context.new_page()
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        try:
+                            page.goto(target_url, wait_until="commit", timeout=15000)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[{platform_key}] 新开 tab 失败: {e}")
+
+            import threading as _threading
+            _threading.Thread(target=_async_new_tab, daemon=True).start()
+            print(f"[{platform_key}] 复用浏览器窗口，新开 tab（异步）")
             return True, ""
         except Exception as e:
             print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
@@ -4383,6 +4392,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     _force_unlock_chromium_dir(data_dir)
 
     # 启动 chrome.exe（单进程，5 个平台共用）
+    # v8.3.9: 不在 cmd 里加 target_url，避免初始页 tab + CDP new_page 重复双 tab
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4393,7 +4403,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=Translate",
-        target_url,
+        "--no-startup-window",  # 不自动打开 initial tab
     ]
     creation_flags = 0
     if sys.platform == 'win32':
@@ -4438,15 +4448,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                 return
 
             context = browser.contexts[0]
-            page = context.new_page()
-            try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                try:
-                    page.goto(target_url, wait_until="commit", timeout=15000)
-                except Exception:
-                    pass
-
+            # v8.3.9: 不要 new_page()，因为 chrome.exe 已启动无 initial tab，
+            # 直接 goto 第一个 page（其实没有页面所以这一步会失败）；
+            # 让 main_window._open_platform_in_chromium 在第一次点击时建 tab
+            # → 改为：主线程 return True 后立即由外部异步 new_page + goto
             _PLATFORM_BROWSER_RUNNERS.append((p, browser))
             _SHARED_BROWSER_SESSION = (p, browser, chrome_proc, port)
             result["ok"] = True
