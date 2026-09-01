@@ -4329,37 +4329,31 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         return False, f"不支持的平台: {platform_key}"
 
     # v8.3.8: 已有共享浏览器 → 在同一窗口新开（不重启窗口、不 taskkill）
-    # v8.3.9: new_page + goto 放进 daemon thread，主线程立即返回（流畅）
-    # v8.4.1: wait_until="commit" 优先（最快响应），失败再 fallback 到 load，
-    #           timeout 缩短到 15 秒（chrome 已运行，goto 不需要 30 秒）
+    # v8.4.3: 改回同步路径（主线程等 goto），错误透传到 UI。
+    # 之前 daemon thread 异步 + silent except → 用户看到 about:blank 假成功，
+    # 实际 goto 失败（被 except 吞掉）。同步路径 chrome 已运行情况下 goto 通常 1-3 秒。
     if _SHARED_BROWSER_SESSION is not None:
         try:
             _, browser, _, _ = _SHARED_BROWSER_SESSION
             context = browser.contexts[0]
-
-            def _async_new_tab():
+            page = context.new_page()
+            try:
+                page.set_default_navigation_timeout(20000)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as e1:
                 try:
-                    page = context.new_page()
-                    page.set_default_navigation_timeout(15000)
+                    # fallback 到 commit（最快响应）
+                    page.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception as e2:
+                    # 两次都失败：关闭残留 about:blank tab，返回错误
                     try:
-                        # wait_until="commit" = 收到 HTTP 响应即可（最快）
-                        page.goto(target_url, wait_until="commit", timeout=15000)
+                        page.close()
                     except Exception:
-                        try:
-                            # fallback: 等到 load 事件（页面资源加载完成）
-                            page.goto(target_url, wait_until="load", timeout=15000)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"[{platform_key}] 新开 tab 失败: {e}")
-
-            import threading as _threading
-            _threading.Thread(target=_async_new_tab, daemon=True).start()
-            print(f"[{platform_key}] 复用浏览器窗口，新开 tab（异步）")
+                        pass
+                    return False, f"goto 失败: domcontentloaded={e1}, commit={e2}"
             return True, ""
         except Exception as e:
-            print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
-            _SHARED_BROWSER_SESSION = None
+            return False, f"新开 tab 失败: {e}"
 
     # v8.3.8: 启动共享 chrome.exe（5 个平台共用）
     port = _CDP_PORT_SHARED
@@ -4399,11 +4393,11 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     # 启动 chrome.exe（单进程，5 个平台共用）
     # v8.3.10: 不要 --no-startup-window（否则 chrome 不开窗口导致用户看不到）。
     #           带 target_url 作为初始 tab，CDP 接管后**复用初始 tab**（避免双 tab）。
-    # v8.4.1: 去掉 --no-sandbox（chrome 145+ 标记为不支持命令行标记，触发警告条
-    #           "您使用的不受支持的命令行标记"，可能影响新 tab 渲染稳定性）。
-    # v8.4.2: 加回 --no-sandbox：v8.4.1 去掉后 chrome 默认 sandbox 在某些 Windows
-    #           环境启动失败（job object 创建超时），CDP 连接超时。加回 --no-sandbox
-    #           是稳定启动的妥协（黄色警告条可接受，但不能 CDP 连接失败）。
+    # v8.4.1: 去掉 --no-sandbox（chrome 145+ 标记为不支持命令行标记，触发警告条）。
+    # v8.4.2: 加回 --no-sandbox（默认 sandbox 在某些 Windows 环境启动失败）。
+    # v8.4.3: 简化 cmd，移除 --disable-blink-features=AutomationControlled
+    #           （之前为了抖音反爬保留，但可能干扰 chrome 渲染，导致新 tab 加载异常
+    #           或老页面 CSS 错位）。chrome 默认 webdriver=true 对抖音风控影响有限。
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4412,7 +4406,6 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         "--no-first-run",
         "--no-default-browser-check",
         "--no-sandbox",
-        "--disable-blink-features=AutomationControlled",
         target_url,
     ]
     creation_flags = 0
