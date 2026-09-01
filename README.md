@@ -53,8 +53,8 @@ _（欢迎提 PR 补充截图）_
 
 ## 技术栈
 
-- Python 3.14
-- tkinter GUI
+- Python 3.12
+- PySide6（Qt6 GUI）
 - Playwright（浏览器自动化）
 - yt-dlp（抖音等平台流提取）
 - ffmpeg（HEVC 转码代理）
@@ -62,7 +62,7 @@ _（欢迎提 PR 补充截图）_
 
 ## 版本
 
-当前版本：**v8.2.8**
+当前版本：**v8.3.0**（Qt UI 重写版）
 
 ## 作者
 
