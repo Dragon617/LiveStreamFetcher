@@ -9,6 +9,41 @@ theme.py — PySide6 版本的主题定义（单一数据源）
 
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _read_version() -> str:
+    """从项目根目录 VERSION 文件读取版本号（版本号唯一真相来源）。
+
+    兼容三种运行环境：
+      1. 开发模式（源码运行）：项目根目录 VERSION
+      2. PyInstaller onefile：_MEIPASS 内打包的 VERSION
+      3. fallback：读取失败返回默认 "8.3.0"
+    """
+    # 候选基础目录：_MEIPASS（打包）→ 项目根（开发）
+    bases = []
+    if getattr(sys, "_MEIPASS", None):
+        bases.append(sys._MEIPASS)
+    bases.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    for base in bases:
+        p = os.path.join(base, "VERSION")
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    ver = f.read().strip()
+                    if ver:
+                        return ver
+            except Exception:
+                continue
+    return "8.3.0"
+
+
+# 应用版本号（全局唯一数据源，UI 显示 / EXE 命名都引用它）
+APP_VERSION = _read_version()
+APP_VERSION_FULL = f"v{APP_VERSION}"
+
 
 class Colors:
     """深色玻璃感 · 圆角仪表盘风格主题色板"""

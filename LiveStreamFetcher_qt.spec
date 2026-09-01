@@ -30,6 +30,7 @@ hiddenimports = [
 # ── Qt 资源 + 嵌入式资源 ──
 datas = [
     ('qt_app/styles.qss', 'qt_app'),
+    ('VERSION', '.'),
     # 平台图标（5 个真实 PNG）
     ('icons/dy_real.png', 'icons'),
     ('icons/ks_real.png', 'icons'),

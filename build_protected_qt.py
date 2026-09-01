@@ -28,6 +28,22 @@ BUILD_DIR = os.path.join(PROJECT_DIR, "build_protected")
 
 PYTHON = r"D:\Python312\python.exe"
 
+
+def _read_version() -> str:
+    """从 VERSION 文件读取版本号（EXE 命名的唯一数据源）。"""
+    p = os.path.join(PROJECT_DIR, "VERSION")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            ver = f.read().strip()
+            if ver:
+                return ver
+    except Exception:
+        pass
+    return "8.3.0"
+
+
+APP_VERSION = _read_version()   # 例如 "8.3.0"
+
 # ─── Qt 版 spec 模板 ───
 QT_SPEC_TEMPLATE = r'''# -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
@@ -35,6 +51,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 datas = [
     (r'qt_app\styles.qss', 'qt_app'),
+    (r'{project_dir}\VERSION', '.'),
     (r'{project_dir}\icons\dy_real.png', 'icons'),
     (r'{project_dir}\icons\ks_real.png', 'icons'),
     (r'{project_dir}\icons\tb_real.png', 'icons'),
@@ -92,7 +109,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v8.3.0',
+    name='LiveStreamFetcher_v{app_version}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -163,7 +180,7 @@ def main():
 
     # ── 生成 spec 并打包 ──
     print("\n[8/8] 生成 spec 并执行 PyInstaller 打包...")
-    spec_content = QT_SPEC_TEMPLATE.format(build_dir=BUILD_DIR, project_dir=PROJECT_DIR)
+    spec_content = QT_SPEC_TEMPLATE.format(build_dir=BUILD_DIR, project_dir=PROJECT_DIR, app_version=APP_VERSION)
     spec_path = os.path.join(BUILD_DIR, "LiveStreamFetcher_qt_protected.spec")
     with open(spec_path, "w", encoding="utf-8") as f:
         f.write(spec_content)
@@ -175,11 +192,11 @@ def main():
     env["CODEBUDDY_SAFE_DELETE_ENABLED"] = "0"
     result = subprocess.run(cmd, cwd=BUILD_DIR, env=env)
 
-    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v8.3.0.exe")
+    output_exe = os.path.join(BUILD_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}.exe")
     if os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
         print(f"\n  打包成功: {output_exe} ({size_mb:.1f} MB)")
-        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v8.3.0.exe")
+        project_dist = os.path.join(PROJECT_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)

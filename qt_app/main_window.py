@@ -17,7 +17,7 @@ from PySide6.QtCore import QUrl
 import os
 import sys
 
-from .theme import Colors, PLATFORM_META
+from .theme import Colors, PLATFORM_META, APP_VERSION_FULL
 from .widgets.stream_card import StreamCard
 from .controller import FetchWorker, LoginCheckWorker, ProxyStartWorker
 from .transcode_dialog import TranscodeDialog
@@ -36,7 +36,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("影视匠直播流获取工具 v8.2.8 · LONGSHAO")
+        self.setWindowTitle(f"影视匠直播流获取工具 {APP_VERSION_FULL} · LONGSHAO")
         self.resize(1080, 800)
         self.setMinimumSize(960, 720)
 
@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 6)
         h.setSpacing(8)
 
-        title = QLabel("🎬 影视匠直播流获取工具 v8.2.8")
+        title = QLabel(f"🎬 影视匠直播流获取工具 {APP_VERSION_FULL}")
         title.setStyleSheet(
             f"font-size: 14px; font-weight: bold; color: {Colors.TEXT_PRIMARY};"
             f"background: transparent;"
@@ -99,8 +99,8 @@ class MainWindow(QMainWindow):
         h.addWidget(title)
         h.addStretch(1)
 
-        # 右侧 v8.2.8 徽章（深色背景，对齐 v8.2.8 截图）
-        ver_badge = QLabel("v8.2.8")
+        # 右侧版本徽章
+        ver_badge = QLabel(APP_VERSION_FULL)
         ver_badge.setStyleSheet(
             f"font-size: 11px; color: #f0f4ff;"
             f"background: #252b45; border: 1px solid #3a4258;"
