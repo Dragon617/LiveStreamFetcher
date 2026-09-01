@@ -4308,7 +4308,7 @@ _PLATFORM_BROWSER_MAP = {
 
 
 def _open_platform_in_chromium(platform_key: str, target_url: str,
-                              wait_timeout: float = 15.0) -> tuple:
+                              wait_timeout: float = 30.0) -> tuple:
     """用对应平台的嵌入式 Chromium 浏览器打开 URL（与解析时的浏览器共享 cookie）。
 
     v8.3.8 重大改进：所有 5 个平台共用**同一个** chrome.exe 浏览器进程 + 单 CDP 端口
@@ -4400,9 +4400,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     # v8.3.10: 不要 --no-startup-window（否则 chrome 不开窗口导致用户看不到）。
     #           带 target_url 作为初始 tab，CDP 接管后**复用初始 tab**（避免双 tab）。
     # v8.4.1: 去掉 --no-sandbox（chrome 145+ 标记为不支持命令行标记，触发警告条
-    #           "您使用的不受支持的命令行标记"，可能影响新 tab 渲染稳定性）和
-    #           --disable-features=Translate（副作用）。保留 --no-sandbox 改成
-    #           --disable-blink-features=AutomationControlled（让 webdriver=undefined）。
+    #           "您使用的不受支持的命令行标记"，可能影响新 tab 渲染稳定性）。
+    # v8.4.2: 加回 --no-sandbox：v8.4.1 去掉后 chrome 默认 sandbox 在某些 Windows
+    #           环境启动失败（job object 创建超时），CDP 连接超时。加回 --no-sandbox
+    #           是稳定启动的妥协（黄色警告条可接受，但不能 CDP 连接失败）。
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4410,6 +4411,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         "--remote-debugging-address=127.0.0.1",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         target_url,
     ]
