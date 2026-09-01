@@ -57,6 +57,10 @@ datas = [
     (r'{project_dir}\icons\tb_real.png', 'icons'),
     (r'{project_dir}\icons\xhs_real.png', 'icons'),
     (r'{project_dir}\icons\yy_real.png', 'icons'),
+    # v8.3.7: 软件主 logo（标题栏 + 窗口图标）
+    (r'{project_dir}\icons\logo_main.png', 'icons'),
+    # v8.3.7: 完整 app_icon.ico（EXE 资源图标 + 任务栏图标，多尺寸 256/128/64/48/32/16）
+    (r'{project_dir}\app_icon.ico', '.'),
     (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     (r'{project_dir}\wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),

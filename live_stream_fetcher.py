@@ -262,13 +262,10 @@ def _ks_parse_playurls_adaptation(play_urls):
 def _get_ks_browser_data_dir():
     """获取快手浏览器持久化缓存目录（cookie / session / localStorage）
 
-    使用 %APPDATA%/LiveStreamFetcher/kuaishou_browser_data 目录，
-    这样 EXE 和源码运行都能找到同一个缓存目录。
+    v8.3.7: 优先放 EXE 同目录 cache/LiveStreamFetcher/kuaishou_browser_data/
+    不可写时回退 %APPDATA%/LiveStreamFetcher/kuaishou_browser_data/
     """
-    base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    d = os.path.join(base, "LiveStreamFetcher", "kuaishou_browser_data")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _get_app_cache_dir("kuaishou_browser_data")
 
 
 def _check_ks_login_status():
@@ -491,16 +488,16 @@ def _get_embedded_chromium_path():
         if os.path.isfile(meipass_path):
             return os.path.dirname(meipass_path)
 
-    # 路径3: 已释放到 AppData
-    appdata_path = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher", "embedded_chromium", "chrome.exe")
-    if os.path.isfile(appdata_path):
-        return os.path.dirname(appdata_path)
+    # 路径3: 已释放到缓存目录（v8.3.7：EXE 同目录优先）
+    cached_path = os.path.join(_get_app_cache_dir("embedded_chromium"), "chrome.exe")
+    if os.path.isfile(cached_path):
+        return os.path.dirname(cached_path)
 
     return None
 
 
 def _extract_embedded_chromium():
-    """从 PyInstaller _MEIPASS 释放 Chromium 到 %APPDATA%/LiveStreamFetcher/embedded_chromium/
+    """从 PyInstaller _MEIPASS 释放 Chromium 到缓存目录（v8.3.7：EXE 同目录优先）
 
     仅在首次运行时执行（检测目标目录无 chrome.exe 则释放）。
     返回释放后的 chromium 目录路径，失败返回 None。
@@ -512,16 +509,14 @@ def _extract_embedded_chromium():
     if not os.path.isdir(src_dir):
         return None
 
-    dst_base = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")
-    dst_dir = os.path.join(dst_base, "embedded_chromium")
+    dst_dir = _get_app_cache_dir("embedded_chromium")
 
     # 已存在则不重复释放
     if os.path.isfile(os.path.join(dst_dir, "chrome.exe")):
         return dst_dir
 
-    print("[Chromium] 首次运行，正在释放嵌入式浏览器到本地（约 400MB）...")
+    print(f"[Chromium] 首次运行，正在释放嵌入式浏览器到本地（约 400MB）→ {dst_dir}")
     try:
-        os.makedirs(dst_dir, exist_ok=True)
         shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
         print(f"[Chromium] 释放完成: {dst_dir}")
         return dst_dir
@@ -1433,11 +1428,12 @@ def _dy_extract_web_rid(url: str) -> str:
 # ─── 抖音 Playwright 浏览器解析 ─────────────────────────
 
 def _get_dy_browser_data_dir():
-    """获取抖音浏览器持久化缓存目录（cookie / session / localStorage）"""
-    base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    d = os.path.join(base, "LiveStreamFetcher", "douyin_browser_data")
-    os.makedirs(d, exist_ok=True)
-    return d
+    """获取抖音浏览器持久化缓存目录（cookie / session / localStorage）
+
+    v8.3.7: 优先放 EXE 同目录 cache/LiveStreamFetcher/douyin_browser_data/
+    不可写时回退 %APPDATA%/LiveStreamFetcher/douyin_browser_data/
+    """
+    return _get_app_cache_dir("douyin_browser_data")
 
 
 def _check_dy_login_status():
@@ -2182,11 +2178,11 @@ def _deep_search_key(data: dict, target_key: str, depth: int = 5) -> dict:
 # ─── 小红书 ───────────────────────────────────────────────
 
 def _get_xhs_browser_data_dir():
-    """获取小红书浏览器持久化缓存目录（cookie / session / localStorage）"""
-    base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    d = os.path.join(base, "LiveStreamFetcher", "xiaohongshu_browser_data")
-    os.makedirs(d, exist_ok=True)
-    return d
+    """获取小红书浏览器持久化缓存目录（cookie / session / localStorage）
+
+    v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/xiaohongshu_browser_data/
+    """
+    return _get_app_cache_dir("xiaohongshu_browser_data")
 
 
 def _check_xhs_login_status():
@@ -3033,11 +3029,11 @@ def fetch_xiaohongshu(url: str, proxy: str = "") -> dict:
 # ─── 淘宝直播 ─────────────────────────────────────────────
 
 def _get_tb_browser_data_dir():
-    """获取淘宝浏览器持久化缓存目录"""
-    base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    d = os.path.join(base, "LiveStreamFetcher", "taobao_browser_data")
-    os.makedirs(d, exist_ok=True)
-    return d
+    """获取淘宝浏览器持久化缓存目录
+
+    v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/taobao_browser_data/
+    """
+    return _get_app_cache_dir("taobao_browser_data")
 
 
 def _tb_extract_live_id(url: str) -> str:
@@ -3559,9 +3555,11 @@ def fetch_taobao_live(url: str, proxy: str = "") -> dict:
 # ═══════════════════════════════════════════════════════
 
 def _get_yy_browser_data_dir():
-    """获取YY浏览器持久化缓存目录"""
-    base = os.environ.get("APPDATA", os.path.expanduser("~"))
-    return os.path.join(base, "LiveStreamFetcher", "yy_browser_data")
+    """获取YY浏览器持久化缓存目录
+
+    v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/yy_browser_data/
+    """
+    return _get_app_cache_dir("yy_browser_data")
 
 
 def _yy_extract_room_id(url: str):
@@ -4098,14 +4096,9 @@ def _clear_system_proxy() -> None:
 # %APPDATA%/LiveStreamFetcher/visit_count.json 持久化计数，
 # 跨版本累计，启动时 +1。
 def _get_visit_count_path() -> str:
-    import os as _os
-    base = _os.environ.get("APPDATA") or _os.path.expanduser("~")
-    folder = _os.path.join(base, "LiveStreamFetcher")
-    try:
-        _os.makedirs(folder, exist_ok=True)
-    except Exception:
-        pass
-    return _os.path.join(folder, "visit_count.json")
+    """v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/visit_count.json
+    不可写时回退到 %APPDATA%/LiveStreamFetcher/visit_count.json"""
+    return _get_app_cache_dir("visit_count.json")
 
 
 def _load_visit_count() -> int:
@@ -4165,7 +4158,70 @@ _PLATFORM_BROWSER_RUNNERS = []
 # v8.3.5: 平台 key → (p, context) 的 session 表
 # 用于复用同一个浏览器窗口：再次点击同一平台 tab 时直接 new_page() 新开 tab，
 # 不再启动新浏览器窗口、不再 taskkill 用户的现有窗口。
+# v8.3.7: 改为 (p, browser, chrome_proc) 三元组，CDP 连接 + 自己启动的 chrome.exe
 _PLATFORM_BROWSER_SESSIONS = {}
+
+# v8.3.7: 给每个平台分配固定 CDP 调试端口
+# 用 subprocess.Popen 启动 chrome.exe + --remote-debugging-port=N
+# Playwright 用 connect_over_cdp("http://127.0.0.1:N") 连接控制
+_CDP_PORT_MAP = {
+    "dy": 9223,
+    "ks": 9224,
+    "xhs": 9225,
+    "tb": 9226,
+    "yy": 9227,
+}
+
+
+# v8.3.7: 应用缓存目录统一管理（便携优先）
+# 默认优先 EXE 同目录（便携模式），EXE 同目录不可写时回退到 %APPDATA%
+# 彻底避免在系统盘/AppData 留下缓存文件
+_APP_CACHE_DIR_LOCK = threading.Lock()
+_APP_CACHE_DIR_BASE = None
+
+
+def _get_app_cache_dir(subdir: str = "") -> str:
+    """获取应用缓存子目录（v8.3.7：便携优先）。
+
+    优先级：
+    1. EXE 同目录下的 cache/LiveStreamFetcher/{subdir}（便携模式，跨电脑友好）
+    2. EXE 同目录不可写 → 回退 %APPDATA%/LiveStreamFetcher/{subdir}
+
+    Args:
+        subdir: 子目录名（如 "embedded_chromium", "wechat_video_tool", "visit_count.json"）
+
+    Returns:
+        完整路径（已确保目录存在）
+    """
+    global _APP_CACHE_DIR_BASE
+
+    # 找 EXE 同目录
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1. 优先 EXE 同目录（便携）
+    with _APP_CACHE_DIR_LOCK:
+        if _APP_CACHE_DIR_BASE is None:
+            portable_base = os.path.join(exe_dir, "cache", "LiveStreamFetcher")
+            try:
+                os.makedirs(portable_base, exist_ok=True)
+                test_file = os.path.join(portable_base, ".write_test")
+                with open(test_file, 'w', encoding='utf-8') as f:
+                    f.write('test')
+                os.remove(test_file)
+                _APP_CACHE_DIR_BASE = portable_base
+            except Exception:
+                # 2. 回退 %APPDATA%（EXE 同目录不可写时）
+                _APP_CACHE_DIR_BASE = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")
+
+    target = os.path.join(_APP_CACHE_DIR_BASE, subdir) if subdir else _APP_CACHE_DIR_BASE
+    try:
+        os.makedirs(target, exist_ok=True)
+    except Exception:
+        pass
+    return target
 
 
 def _cleanup_all_playwright_contexts():
@@ -4177,15 +4233,19 @@ def _cleanup_all_playwright_contexts():
        "Failed to remove temporary directory" 警告。
     2. Playwright driver 进程残留，可能端口冲突下次启动。
 
-    v8.3.6 修复：atexit 钩子末尾加 taskkill /F /IM chrome.exe，强制杀掉所有
-    Chromium 子进程（主/渲染/GPU/utility），彻底释放 _MEIPASS 临时目录文件锁。
+    v8.3.6: 强制 taskkill chrome.exe 释放 _MEIPASS 临时目录锁
+    v8.3.7: 优先用 session 里的 chrome_proc 句柄优雅 terminate，taskkill 兜底
     """
-    # 1. 优雅关闭 Playwright（关闭所有 context，停止 driver）
+    # 1. 优雅关闭 Playwright
     for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
-            _, ctx = entry
-            if ctx is not None:
-                ctx.close()
+            _, ctx_or_browser = entry
+            if ctx_or_browser is not None:
+                # launch_persistent_context 的 context 或 CDP 的 browser
+                if hasattr(ctx_or_browser, 'close'):
+                    ctx_or_browser.close()
+                elif hasattr(ctx_or_browser, 'contexts'):
+                    ctx_or_browser.close()
         except Exception:
             pass
         try:
@@ -4195,12 +4255,20 @@ def _cleanup_all_playwright_contexts():
         except Exception:
             pass
     _PLATFORM_BROWSER_RUNNERS.clear()
+
+    # 2. v8.3.7: 优先用 session 里的 chrome_proc 句柄 terminate
+    for platform_key, sess in list(_PLATFORM_BROWSER_SESSIONS.items()):
+        try:
+            _, _, chrome_proc = sess
+            if chrome_proc and chrome_proc.poll() is None:
+                chrome_proc.terminate()
+        except Exception:
+            pass
     _PLATFORM_BROWSER_SESSIONS.clear()
 
-    # 2. 强制 taskkill 残留 chrome.exe（关键：释放 _MEIPASS 临时目录文件锁）
-    #    ctx.close() 不等于 chrome.exe 完全退出，需要等子进程结束或强制 kill
+    # 3. 强制 taskkill 残留 chrome.exe（关键：释放 _MEIPASS 临时目录锁）
     import time as _time
-    _time.sleep(1.5)   # 给 Playwright 优雅关闭 1.5 秒
+    _time.sleep(1.5)
     if sys.platform == "win32":
         try:
             subprocess.run(
@@ -4232,21 +4300,15 @@ _PLATFORM_BROWSER_MAP = {
 
 
 def _open_platform_in_chromium(platform_key: str, target_url: str,
-                              wait_timeout: float = 10.0) -> tuple:
-    """用对应平台的 persistent_context 浏览器打开 URL（与解析时的浏览器共享 cookie）。
+                              wait_timeout: float = 20.0) -> tuple:
+    """用对应平台的嵌入式 Chromium 浏览器打开 URL（与解析时的浏览器共享 cookie）。
 
-    用户点击平台 tab 时调用此函数 → 弹出嵌入式 Chromium（带 cookie 持久化）。
-    用户登录后关闭 → cookie 留在 data_dir。下次解析时（fetch_xxx 用同一 data_dir
-    启动浏览器）自动带上登录态，无需重复登录。
-
-    v8.3.1 修复：去掉 `with sync_playwright()` 上下文（函数返回时 p.stop() 会杀浏览器）
-    v8.3.4 修复：之前 daemon thread 函数体执行完 `page.goto` 后立即返回 → thread 退出 →
-               Playwright Sync API 的连接线程清理 → driver 进程被杀 → 浏览器闪退。
-               现在让 _launch 阻塞直到浏览器窗口全部关闭。
-    v8.3.5 修复：之前每次点击都 taskkill 现有窗口 + 重启浏览器 → 用户看到闪烁。
-               现在按 platform_key 维护 session。
-    v8.3.6 修复：之前 daemon thread 启动失败被 except 静默吞掉，状态栏假"已打开"。
-               现在同步等待启动结果（最多 10s），把真实错误返回给 UI。
+    v8.3.7 重大修复：之前用 Playwright launch_persistent_context 在某些 Windows
+    环境（用户机器）启动 chrome.exe 但 GUI 窗口不弹出，状态栏显示"已打开"实际
+    没看到浏览器窗口。现在改用：
+      1. subprocess.Popen 直接启动 chrome.exe（窗口保证显示）
+      2. Playwright 通过 CDP 端口（9223-9227）连接控制
+      3. cookie 通过 --user-data-dir 参数持久化（与解析流 fetch_xxx 共享）
 
     Returns:
         (ok: bool, error_msg: str)
@@ -4258,8 +4320,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     existing = _PLATFORM_BROWSER_SESSIONS.get(platform_key)
     if existing is not None:
         try:
-            _, ctx = existing
-            page = ctx.new_page()
+            # v8.3.7: session 结构从 (p, context) 改为 (p, browser, chrome_proc)
+            _, browser, _ = existing
+            context = browser.contexts[0]
+            page = context.new_page()
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
@@ -4273,65 +4337,102 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
             print(f"[{platform_key}] session 失效 {e}，重新启动浏览器")
             _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
 
+    # v8.3.7: 用 subprocess.Popen 直接启动 chrome.exe（绕过 Playwright launch GUI 不显示问题）
+    port = _CDP_PORT_MAP.get(platform_key)
+    if not port:
+        return False, f"平台 {platform_key} 没有 CDP 端口分配"
+
+    # chrome.exe 路径
+    browser_path = _ensure_chromium_ready()
+    if not browser_path:
+        return False, "chromium 未找到，请确认内嵌 chromium 已打包"
+    chrome_exe = os.path.join(browser_path, "chrome.exe")
+    if not os.path.isfile(chrome_exe):
+        return False, f"chrome.exe 不存在: {chrome_exe}"
+
+    # data_dir
     data_dir_func, _ = _PLATFORM_BROWSER_MAP[platform_key]
     data_dir = data_dir_func()
 
-    # v8.3.6: 同步等待启动结果（之前直接 return True 让 UI 显示假"已打开"）
+    # 检查端口是否被占用（残留 chrome.exe），被占用则 taskkill 释放
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    port_in_use = sock.connect_ex(("127.0.0.1", port)) == 0
+    sock.close()
+    if port_in_use:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/FI", f"TCP PORT EQ {port}", "/T"],
+                capture_output=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+        import time as _time
+        _time.sleep(1.5)
+
+    # 强制解锁 data_dir（防 SingletonLock 残留）
+    _force_unlock_chromium_dir(data_dir)
+
+    # 启动 chrome.exe（独立进程组，atexit 统一清理）
+    cmd = [
+        chrome_exe,
+        f"--user-data-dir={data_dir}",
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=Translate",
+        target_url,
+    ]
+    creation_flags = 0
+    if sys.platform == 'win32':
+        # CREATE_NO_WINDOW (0x08000000) 不显示控制台窗口
+        creation_flags = 0x08000000
+    try:
+        chrome_proc = subprocess.Popen(
+            cmd,
+            cwd=browser_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+    except Exception as e:
+        return False, f"启动 chrome.exe 失败: {e}"
+
+    # 同步等待 CDP 连接（最多 wait_timeout 秒）
+    import time as _time
     import threading as _threading
     ready_event = _threading.Event()
     result = {"ok": False, "error": "未启动"}
 
-    def _launch():
+    def _connect():
         try:
             from playwright.sync_api import sync_playwright
-        except ImportError:
-            result["error"] = "playwright 未安装"
-            ready_event.set()
-            return
-
-        # 抑制 Playwright 子进程弹出 CMD 黑窗口
-        if sys.platform == "win32":
-            _orig_popen = subprocess.Popen
-            def _no_console_popen(*args, **kwargs):
-                kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
-                return _orig_popen(*args, **kwargs)
-            subprocess.Popen = _no_console_popen
-
-        # 强制解锁数据目录（只在首次启动时调用；复用 session 不会经过这里）
-        _force_unlock_chromium_dir(data_dir)
-
-        try:
-            p = sync_playwright().start()   # 手动 start()，不退出 = 不杀浏览器
-            browser_path = _ensure_chromium_ready()
-            launch_kwargs = {
-                "headless": False,
-                "viewport": {"width": 1280, "height": 800},
-                "args": [
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            }
-            if browser_path:
-                launch_kwargs["executable_path"] = os.path.join(browser_path, "chrome.exe")
-            context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
-            # 注册到长生命周期列表，EXE 退出时统一清理
-            _PLATFORM_BROWSER_RUNNERS.append((p, context))
-            # 注册到 session 表（v8.3.5）
-            _PLATFORM_BROWSER_SESSIONS[platform_key] = (p, context)
-            # 标记启动成功
-            result["ok"] = True
-            result["error"] = ""
-            ready_event.set()
-
-            # 关闭残留 about:blank
-            for existing_page in list(context.pages):
+            p = sync_playwright().start()
+            browser = None
+            for _attempt in range(int(wait_timeout)):
                 try:
-                    existing_page.close()
+                    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                    if browser:
+                        break
                 except Exception:
                     pass
-            page = context.new_page() if not context.pages else context.pages[0]
-            # 跳转到目标 URL
+                _time.sleep(1)
+
+            if not browser:
+                p.stop()
+                try: chrome_proc.terminate()
+                except Exception: pass
+                result["error"] = f"CDP 连接超时（端口 {port}）"
+                ready_event.set()
+                return
+
+            context = browser.contexts[0]
+            page = context.new_page()
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             except Exception:
@@ -4340,36 +4441,20 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                 except Exception:
                     pass
 
-            # v8.3.4: 阻塞直到浏览器窗口关闭
-            # v8.3.5: 用户在新 tab 里打开新页面后，context.pages 仍非空，继续监视
-            while True:
-                try:
-                    pages = list(context.pages)
-                    if not pages:
-                        break
-                    pages[0].wait_for_event("close", timeout=600000)   # 10 分钟超时
-                except Exception:
-                    try:
-                        if not context.pages:
-                            break
-                    except Exception:
-                        break
+            _PLATFORM_BROWSER_RUNNERS.append((p, browser))
+            _PLATFORM_BROWSER_SESSIONS[platform_key] = (p, browser, chrome_proc)
+            result["ok"] = True
+            result["error"] = ""
+            ready_event.set()
         except Exception as e:
             result["error"] = str(e)[:200]
             ready_event.set()
-            try:
-                print(f"[{platform_key}] 浏览器启动失败: {e}")
-            except Exception:
-                pass
-        finally:
-            _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
 
-    _threading.Thread(target=_launch, daemon=True).start()
+    _threading.Thread(target=_connect, daemon=True).start()
 
-    # v8.3.6: 同步等待启动结果（最多 wait_timeout 秒）
-    if ready_event.wait(timeout=wait_timeout):
+    if ready_event.wait(timeout=wait_timeout + 5):
         return result["ok"], result["error"]
-    return False, "浏览器启动超时"
+    return False, "启动超时"
 
 
 # ─── yt-dlp 降级方案 ──────────────────────────────────────
@@ -6378,31 +6463,34 @@ def _find_ffmpeg() -> str:
 
 
 def _find_wechat_video_tool():
-    """查找微信视频号下载工具 EXE：优先 2.8，回退 2.6。"""
+    """查找微信视频号下载工具 EXE：优先 2.8，回退 2.6。
+
+    v8.3.7: 查找路径 EXE 同目录 → _MEIPASS → _get_app_cache_dir (EXE 同目录优先) → APPDATA
+    """
     candidates = ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe")
     exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-    # _MEIPASS 本身（PyInstaller onefile 解压临时目录），不是 _MEIPASS/..
     meipass_base = sys._MEIPASS if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else ""
+    appdata_dir = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")
+    cached_dir = _get_app_cache_dir("wechat_video_tool")
 
     for exe_name in candidates:
-        for base in [exe_dir, meipass_base,
-                     os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")]:
+        for base in [exe_dir, meipass_base, cached_dir, appdata_dir]:
             if not base:
                 continue
-            p = os.path.join(base, "wechat_video_tool", exe_name)
+            p = os.path.join(base, exe_name) if base == exe_dir or base == meipass_base else os.path.join(base, exe_name)
             if os.path.isfile(p):
                 return p
     return None
 
 
 def _extract_embedded_wechat_video_tool():
-    """从 _MEIPASS 释放微信视频号下载工具到 AppData（首次运行）。"""
+    """从 _MEIPASS 释放微信视频号下载工具到缓存目录（v8.3.7：EXE 同目录优先）。"""
     if not getattr(sys, 'frozen', False) or not hasattr(sys, '_MEIPASS'):
         return None
     src_dir = os.path.join(sys._MEIPASS, "wechat_video_tool")
     if not os.path.isdir(src_dir):
         return None
-    dst_dir = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher", "wechat_video_tool")
+    dst_dir = _get_app_cache_dir("wechat_video_tool")
     # 检查已释放版本（任一版本即跳过）
     for exe_name in ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe"):
         cached = os.path.join(dst_dir, exe_name)
@@ -6593,7 +6681,7 @@ def is_wechat_certificates_installed(cert_dir: str = None) -> bool:
 
 
 def _extract_embedded_ffmpeg():
-    """从 PyInstaller _MEIPASS 释放 ffmpeg.exe 到 %APPDATA%/LiveStreamFetcher/embedded_ffmpeg/
+    """从 PyInstaller _MEIPASS 释放 ffmpeg.exe 到缓存目录（v8.3.7：EXE 同目录优先）
 
     仅在首次运行时执行。返回 ffmpeg.exe 路径，失败返回 None。
     """
@@ -6604,16 +6692,14 @@ def _extract_embedded_ffmpeg():
     if not os.path.isdir(src_dir):
         return None
 
-    dst_base = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")
-    dst_dir = os.path.join(dst_base, "embedded_ffmpeg")
+    dst_dir = _get_app_cache_dir("embedded_ffmpeg")
 
     # 已存在则不重复释放
     if os.path.isfile(os.path.join(dst_dir, "ffmpeg.exe")):
         return os.path.join(dst_dir, "ffmpeg.exe")
 
-    print("[ffmpeg] 首次运行，正在释放嵌入式 ffmpeg 到本地...")
+    print(f"[ffmpeg] 首次运行，正在释放嵌入式 ffmpeg 到本地 → {dst_dir}")
     try:
-        os.makedirs(dst_dir, exist_ok=True)
         shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
         result = os.path.join(dst_dir, "ffmpeg.exe")
         print(f"[ffmpeg] 释放完成: {result}")

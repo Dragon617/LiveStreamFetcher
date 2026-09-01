@@ -40,6 +40,15 @@ class MainWindow(QMainWindow):
         self.resize(1080, 800)
         self.setMinimumSize(960, 720)
 
+        # v8.3.7: 设置窗口图标（任务栏 + Alt-Tab）
+        from PySide6.QtGui import QIcon
+        _app_root = os.path.dirname(os.path.dirname(__file__))
+        for icon_name in ("app_icon.ico", os.path.join("icons", "logo_main.png")):
+            icon_path = os.path.join(_app_root, icon_name) if not os.path.isabs(icon_name) else icon_name
+            if os.path.isfile(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                break
+
         self._stream_cards = []
         self._all_streams = []
         self._result_platform = ""
@@ -103,7 +112,19 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 6)
         h.setSpacing(8)
 
-        title = QLabel(f"🎬 影视匠直播流获取工具 {APP_VERSION_FULL}")
+        # v8.3.7: 标题栏左侧 logo（用真实 PNG，替代之前的 🎬 emoji）
+        from PySide6.QtGui import QPixmap
+        logo_label = QLabel()
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icons", "logo_main.png")
+        if os.path.isfile(logo_path):
+            logo_pixmap = QPixmap(logo_path).scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            logo_label.setPixmap(logo_pixmap)
+        else:
+            logo_label.setText("🎬")
+        logo_label.setStyleSheet("background: transparent;")
+        h.addWidget(logo_label)
+
+        title = QLabel(f"影视匠直播流获取工具 {APP_VERSION_FULL}")
         title.setStyleSheet(
             f"font-size: 14px; font-weight: bold; color: {Colors.TEXT_PRIMARY};"
             f"background: transparent;"
