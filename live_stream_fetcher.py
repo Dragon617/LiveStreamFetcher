@@ -4162,6 +4162,11 @@ PLATFORM_FETCHERS = {
 # 正确做法：手动 start()，让 driver 与浏览器一起驻留，EXE 退出时再统一 stop。
 _PLATFORM_BROWSER_RUNNERS = []
 
+# v8.3.5: 平台 key → (p, context) 的 session 表
+# 用于复用同一个浏览器窗口：再次点击同一平台 tab 时直接 new_page() 新开 tab，
+# 不再启动新浏览器窗口、不再 taskkill 用户的现有窗口。
+_PLATFORM_BROWSER_SESSIONS = {}
+
 
 def _cleanup_all_playwright_contexts():
     """EXE 退出时统一关闭所有 Playwright 浏览器 context。
@@ -4186,6 +4191,7 @@ def _cleanup_all_playwright_contexts():
         except Exception:
             pass
     _PLATFORM_BROWSER_RUNNERS.clear()
+    _PLATFORM_BROWSER_SESSIONS.clear()
 
 
 import atexit
@@ -4218,6 +4224,11 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
     v8.3.4 修复：之前 daemon thread 函数体执行完 `page.goto` 后立即返回 → thread 退出 →
                Playwright Sync API 的连接线程清理 → driver 进程被杀 → 浏览器闪退。
                现在让 _launch 阻塞直到浏览器窗口全部关闭。
+    v8.3.5 修复：之前每次点击都 taskkill 现有窗口 + 重启浏览器 → 用户看到闪烁。
+               现在按 platform_key 维护 session：
+               - 已有该平台 session → 复用 context，在同一窗口 new_page() 新开 tab
+               - 没有该平台 session → 启动新 persistent_context（新窗口）
+               这样每次点击都"成功打开"，且同一窗口可累积多个 tab。
 
     Args:
         platform_key: 'dy' | 'ks' | 'xhs' | 'tb' | 'yy'
@@ -4225,6 +4236,27 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
     """
     if platform_key not in _PLATFORM_BROWSER_MAP:
         return False
+
+    # v8.3.5: 已有 session → 复用 + 在同一窗口新开 tab（不再启动新窗口、不 taskkill）
+    existing = _PLATFORM_BROWSER_SESSIONS.get(platform_key)
+    if existing is not None:
+        try:
+            _, ctx = existing
+            page = ctx.new_page()
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                try:
+                    page.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
+            print(f"[{platform_key}] 复用现有浏览器窗口，新开 tab")
+            return True
+        except Exception as e:
+            # session 已失效（context 关闭等）→ 清掉，重启
+            print(f"[{platform_key}] session 失效 {e}，重新启动浏览器")
+            _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
+
     data_dir_func, _ = _PLATFORM_BROWSER_MAP[platform_key]
     data_dir = data_dir_func()
 
@@ -4242,7 +4274,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                 return _orig_popen(*args, **kwargs)
             subprocess.Popen = _no_console_popen
 
-        # 强制解锁数据目录（防 SingletonLock 残留导致 about:blank）
+        # 强制解锁数据目录（只在首次启动时调用；复用 session 不会经过这里）
         _force_unlock_chromium_dir(data_dir)
 
         try:
@@ -4262,6 +4294,8 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
             context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
             # 注册到长生命周期列表，EXE 退出时统一清理
             _PLATFORM_BROWSER_RUNNERS.append((p, context))
+            # 注册到 session 表（v8.3.5）
+            _PLATFORM_BROWSER_SESSIONS[platform_key] = (p, context)
 
             # 关闭残留 about:blank
             for existing_page in list(context.pages):
@@ -4280,25 +4314,28 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                     pass
 
             # v8.3.4: 阻塞直到浏览器窗口关闭
-            # daemon thread 函数体如果立即返回，Playwright Sync API 的连接线程会被
-            # 清理，driver 进程被杀掉，浏览器窗口一闪就消失（用户看到的"闪退"）。
-            # 这里阻塞等到所有 page 都关闭：
+            # v8.3.5: 用户在新 tab 里打开新页面后，context.pages 仍非空，继续监视
             while True:
                 try:
                     pages = list(context.pages)
                     if not pages:
-                        # 浏览器窗口全关了
                         break
-                    # 用 wait_for_event 阻塞等待首个 page 关闭事件
                     pages[0].wait_for_event("close", timeout=600000)   # 10 分钟超时
                 except Exception:
-                    # 任何异常（page 已被关、context 失效等）→ 退出循环
-                    break
+                    # 任何异常（page 已被关、context 失效等）→ 检查是否还有 page
+                    try:
+                        if not context.pages:
+                            break
+                    except Exception:
+                        break
         except Exception as e:
             try:
                 print(f"[{platform_key}] 浏览器启动失败: {e}")
             except Exception:
                 pass
+        finally:
+            # v8.3.5: session 结束（用户关完所有 tab）→ 清掉 session，下次点击会重启
+            _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
 
     threading.Thread(target=_launch, daemon=True).start()
     return True
