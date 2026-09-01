@@ -6621,6 +6621,9 @@ class LocalStreamProxy:
     def start(self, target_url: str) -> str:
         """启动代理服务，返回本地 URL。
 
+        v8.3.3: 端口冲突自动重试。若指定端口被占用，自动递增探测下一个空闲
+        端口（最多 100 次）；port=0 时由 OS 自动分配空闲端口，永不冲突。
+
         Args:
             target_url: 淘宝 alicdn 的原始流链接
 
@@ -6630,9 +6633,27 @@ class LocalStreamProxy:
         self._target_url = target_url
         self._bytes_served = 0
 
-        # 启动 HTTP 服务（随机端口）
-        self._server = _StreamProxyHTTPServer(("127.0.0.1", self._port), self._handle_request)
-        self._actual_port = self._server.server_address[1]
+        # 端口冲突自动重试（v8.3.3）
+        server = None
+        last_err = None
+        port = self._port
+        for _attempt in range(100):
+            try:
+                server = _StreamProxyHTTPServer(("127.0.0.1", port), self._handle_request)
+                break
+            except OSError as e:
+                last_err = e
+                if port == 0:
+                    # 随机端口都失败，说明系统 socket 资源耗尽，直接抛
+                    break
+                # 指定端口被占用 → 递增探测下一个空闲端口
+                port += 1
+
+        if server is None:
+            raise OSError(f"无法分配本地代理端口（从 {self._port} 起尝试了 100 个）: {last_err}")
+
+        self._server = server
+        self._actual_port = server.server_address[1]
         self._running = True
 
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -6658,24 +6679,44 @@ class LocalStreamProxy:
         return self._is_hevc
 
     def stop(self):
-        """停止代理服务"""
+        """停止代理服务（v8.3.3：彻底释放端口）。
+
+        顺序：
+        1. 置 _running=False，停止所有流式转发循环
+        2. 终止所有 ffmpeg 子进程（terminate → 超时 kill）
+        3. 关闭 server socket（释放监听端口）
+        4. join serve_forever 线程（确保线程退出、socket 完全释放）
+        """
         self._running = False
+
+        # 终止 ffmpeg 子进程
         if self._ffmpeg_process:
+            proc = self._ffmpeg_process
+            self._ffmpeg_process = None
             try:
-                self._ffmpeg_process.terminate()
-                self._ffmpeg_process.wait(timeout=5)
+                proc.terminate()
+                proc.wait(timeout=5)
             except Exception:
                 try:
-                    self._ffmpeg_process.kill()
+                    proc.kill()
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
-            self._ffmpeg_process = None
+
+        # 关闭 server socket（释放端口）
         if self._server:
             try:
                 self._server.shutdown()
             except Exception:
                 pass
-        self._server = None
+            self._server = None
+
+        # join serve_forever 线程，确保 socket 完全释放（最多等 2 秒）
+        if self._thread is not None and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=2)
+            except Exception:
+                pass
         self._thread = None
 
     def update_target(self, new_url: str):
@@ -7069,10 +7110,15 @@ class _StreamProxyHTTPServer:
         self.address = address
         self.handler = handler  # handler(method, path, headers) -> (status, headers, body)
         self._running = False
+        self.server_socket = None
 
         # 在 __init__ 中就完成 bind，这样 server_address 属性立即可用
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # v8.3.3: 去掉 SO_REUSEADDR。Windows 上 SO_REUSEADDR 允许两个 socket 绑定
+        # 同一端口（导致端口冲突检测失效、流量被随机分发），而且 LISTEN socket
+        # 关闭后不会进入 TIME_WAIT，无需 SO_REUSEADDR 复用。
+        # 去掉后：端口被占用时 bind 会抛 OSError(10048)，触发 LocalStreamProxy.start()
+        # 的自动重试逻辑；关闭后端口立即释放，可立即重启同一端口。
         self.server_socket.bind(self.address)
         self._addr = self.server_socket.getsockname()
         self.server_socket.listen(5)
@@ -7096,12 +7142,19 @@ class _StreamProxyHTTPServer:
                 break
 
     def shutdown(self):
+        """关闭服务器并释放监听端口（v8.3.3：加 SHUT_RDWR + 置 None）。"""
         self._running = False
         if self.server_socket:
+            sock = self.server_socket
             try:
-                self.server_socket.close()
+                sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self.server_socket = None
 
     def _handle_client(self, client_sock):
         """处理单个客户端连接"""
