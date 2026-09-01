@@ -152,10 +152,11 @@ class TranscodeWorker(QThread):
     def run(self):
         try:
             from live_stream_fetcher import LocalStreamProxy
+            # v8.3.2: 用位置参数，避免防破解混淆改 __init__ 参数名后关键字调用失败
             self.proxy = LocalStreamProxy(
-                port=self.port,
-                platform="通用",
-                codec_hint="hevc",
+                self.port,   # port（位置参数）
+                "通用",       # platform
+                "hevc",      # codec_hint
             )
             local_url = self.proxy.start(self.url)
             self.ready.emit(local_url)

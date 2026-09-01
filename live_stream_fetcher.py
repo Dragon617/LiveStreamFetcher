@@ -6347,6 +6347,166 @@ def _ensure_wechat_video_tool():
     return _extract_embedded_wechat_video_tool()
 
 
+def _install_wechat_certificates(cert_dir: str) -> bool:
+    """安装视频号工具的 mitmproxy CA 证书到 Windows 证书存储。
+
+    视频号工具（mitmproxy-based）抓 HTTPS 视频需要把两个 .p12 装到：
+    - 「受信任的根证书颁发机构」（Root）—— 让 Windows 信任 mitmproxy CA
+    - 「个人」（My）—— 让 mitmproxy 能用私钥签发伪造证书
+
+    v8.3.2 实现路径：
+    1. 用 Python `cryptography` 库从 .p12 提取出 X.509 证书对象
+    2. 序列化为 DER
+    3. 用 ctypes 调 Windows CertAddEncodedCertificateToStore() 加到 Root + My
+
+    避开 certutil CRYPT_E_SELF_SIGNED / PowerShell SecureString UI / OpenSSL 缺失等问题。
+    """
+    if sys.platform != "win32":
+        return True
+
+    p12_files = [
+        os.path.join(cert_dir, "证书.p12"),
+        os.path.join(cert_dir, "证书-cert.p12"),
+    ]
+    p12_files = [p for p in p12_files if os.path.isfile(p)]
+    if not p12_files:
+        print("[视频号证书] 未找到证书文件")
+        return False
+
+    results = []
+    for p12 in p12_files:
+        try:
+            results.append(_install_one_p12_via_crypto(p12))
+        except Exception as e:
+            print(f"[视频号证书] {os.path.basename(p12)} ❌ 异常: {e}")
+            results.append(False)
+    return all(results)
+
+
+def _install_one_p12_via_crypto(p12_path: str) -> bool:
+    """从 .p12 提取所有证书，用 ctypes Windows API 添加到 Root + My store。"""
+    import ctypes
+    from cryptography.hazmat.primitives.serialization import pkcs12, Encoding
+    from cryptography.hazmat.backends import default_backend
+
+    HCERTSTORE = ctypes.c_void_p
+    CERT_STORE_ADD_REPLACE_EXISTING = 0x00000004
+
+    crypt32 = ctypes.WinDLL("crypt32.dll", use_last_error=True)
+    crypt32.CertOpenSystemStoreW.restype = HCERTSTORE
+    crypt32.CertOpenSystemStoreW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    crypt32.CertCloseStore.restype = ctypes.c_bool
+    crypt32.CertCloseStore.argtypes = [HCERTSTORE, ctypes.c_uint]
+    crypt32.CertAddEncodedCertificateToStore.restype = ctypes.c_bool
+    crypt32.CertAddEncodedCertificateToStore.argtypes = [
+        HCERTSTORE,
+        ctypes.c_uint,                 # CERT_ENCODING = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING
+        ctypes.c_char_p,               # pbCertEncoded
+        ctypes.c_uint,                 # cbCertEncoded
+        ctypes.c_uint,                 # dwAddDisposition
+        ctypes.c_void_p,               # ppCertContext (NULL OK)
+    ]
+
+    # 1. Python cryptography 解析 .p12（mitmproxy CA 密码为空）
+    with open(p12_path, "rb") as f:
+        p12_bytes = f.read()
+    try:
+        private_key, certificate, additional_certificates = (
+            pkcs12.load_key_and_certificates(p12_bytes, password=None, backend=default_backend())
+        )
+    except Exception as e:
+        # 密码不对：mitmproxy 默认是空，但有些版本会改
+        try:
+            private_key, certificate, additional_certificates = (
+                pkcs12.load_key_and_certificates(p12_bytes, password=b"mitmproxy", backend=default_backend())
+            )
+        except Exception as e2:
+            print(f"[视频号证书] P12 解析失败: {e2}")
+            return False
+
+    # 收集所有证书：主证书 + 链证书
+    certs = []
+    if certificate is not None:
+        certs.append(certificate)
+    if additional_certificates:
+        certs.extend(additional_certificates)
+
+    # 2. 逐个证书 DER 编码 → ctypes 加到 Root + My
+    added_count = 0
+    for cert_obj in certs:
+        der_bytes = cert_obj.public_bytes(Encoding.DER)
+        der_buf = ctypes.create_string_buffer(der_bytes, len(der_bytes))
+        X509_ASN_ENCODING = 0x00000001
+        for store_name in ("Root", "My"):
+            target = crypt32.CertOpenSystemStoreW(None, store_name)
+            if not target:
+                print(f"[视频号证书] {store_name} 打开失败 err={ctypes.get_last_error():#x}")
+                continue
+            try:
+                ok = crypt32.CertAddEncodedCertificateToStore(
+                    target,
+                    X509_ASN_ENCODING,
+                    der_buf,
+                    len(der_bytes),
+                    CERT_STORE_ADD_REPLACE_EXISTING,
+                    None,
+                )
+                if ok:
+                    added_count += 1
+                else:
+                    err = ctypes.get_last_error()
+                    print(f"[视频号证书] {store_name} add 失败 err={err:#x}")
+            finally:
+                crypt32.CertCloseStore(target, 0)
+    ok = added_count >= len(certs) * 2  # Root + My 两个 store，每个 cert 都要加上
+    print(f"[视频号证书] {os.path.basename(p12_path)} {'✅' if ok else '⚠️'} cert={len(certs)} added={added_count}")
+    return ok
+
+
+def is_wechat_certificates_installed(cert_dir: str = None) -> bool:
+    """检查视频号证书是否已安装（Root CA store 里有 mitmproxy 证书）。"""
+    if sys.platform != "win32":
+        return True
+    cert_dir = cert_dir or os.path.join(
+        os.environ.get("APPDATA", ""), "LiveStreamFetcher", "wechat_video_tool"
+    )
+    p12_files = [
+        os.path.join(cert_dir, "证书.p12"),
+        os.path.join(cert_dir, "证书-cert.p12"),
+    ]
+    if not all(os.path.isfile(p) for p in p12_files):
+        return False
+    try:
+        import ctypes
+        crypt32 = ctypes.WinDLL("crypt32.dll")
+        store = crypt32.CertOpenSystemStoreW(None, "Root")
+        if not store:
+            return False
+        try:
+            crypt32.CertEnumCertificatesInStore.restype = ctypes.c_void_p
+            crypt32.CertEnumCertificatesInStore.argtypes = [ctypes.c_void_p]
+            ctx = crypt32.CertEnumCertificatesInStore(store)
+            while ctx:
+                # CERT_FRIENDLY_NAME_PROP_ID = 0x01
+                buf = (ctypes.c_char * 1024)()
+                size = ctypes.c_uint(1024)
+                if crypt32.CertGetCertificateContextProperty(
+                    ctx, 0x01, buf, ctypes.byref(size)
+                ):
+                    try:
+                        name = buf.value.decode("utf-16-le", errors="ignore")
+                        if "mitmproxy" in name.lower() or "charles" in name.lower():
+                            return True
+                    except Exception:
+                        pass
+                ctx = crypt32.CertEnumCertificatesInStore(store)
+            return False
+        finally:
+            crypt32.CertCloseStore(store, 0)
+    except Exception:
+        return False
+
+
 def _extract_embedded_ffmpeg():
     """从 PyInstaller _MEIPASS 释放 ffmpeg.exe 到 %APPDATA%/LiveStreamFetcher/embedded_ffmpeg/
 

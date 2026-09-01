@@ -512,13 +512,25 @@ class MainWindow(QMainWindow):
             self.platform_info_label.setText(f"系统代理操作失败：{e}")
 
     def _on_wechat_tool(self):
+        """启动视频号下载工具（v8.3.2：启动前先安装 mitmproxy CA 证书）。"""
         try:
-            from live_stream_fetcher import _ensure_wechat_video_tool
+            from live_stream_fetcher import _ensure_wechat_video_tool, _install_wechat_certificates
             exe_path = _ensure_wechat_video_tool()
             if not exe_path:
                 self.platform_info_label.setText("视频号工具未找到")
                 return
-            import subprocess, os
+
+            # v8.3.2: 先安装证书（视频号工具抓 HTTPS 视频必需）
+            cert_dir = os.path.dirname(exe_path)
+            self.platform_info_label.setText("正在安装视频号工具证书...")
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            if _install_wechat_certificates(cert_dir):
+                self.platform_info_label.setText("视频号工具证书已安装，正在启动...")
+            else:
+                self.platform_info_label.setText("视频号工具证书安装失败，仍尝试启动...")
+
+            import subprocess
             subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
             self.platform_info_label.setText("视频号下载工具已启动")
         except Exception as e:
@@ -588,7 +600,7 @@ class MainWindow(QMainWindow):
         self._render_stream_cards(streams)
 
     def _build_spec_chips(self, streams: list):
-        """按清晰度+规格生成 chips。"""
+        """按清晰度生成 chips（v8.3.2：chip 点击后只显示对应清晰度的流）。"""
         # 清空
         while self.spec_chips_layout.count():
             item = self.spec_chips_layout.takeAt(0)
@@ -596,16 +608,64 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-        # 统计 quality_tag + quality
+        if not streams:
+            return
+
+        # 统计 quality_tag → count，按出现次数排序
         from collections import Counter
-        spec_counter = Counter(s.get("quality", "其他").strip() or "其他" for s in streams)
-        for spec, count in spec_counter.most_common():
-            chip = QPushButton(spec)
+        quality_counter = Counter()
+        for s in streams:
+            q = (s.get("quality") or "").strip() or "其他"
+            quality_counter[q] += 1
+
+        # 「全部」chip + 各清晰度 chip
+        all_chip = QPushButton(f"全部 ({len(streams)})")
+        all_chip.setObjectName("specChip")
+        all_chip.setCheckable(True)
+        all_chip.setChecked(self._filter_val == "全部")
+        all_chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        all_chip.setProperty("spec", "全部")
+        all_chip.clicked.connect(lambda: self._apply_filter("全部"))
+        self.spec_chips_layout.addWidget(all_chip)
+
+        for quality, count in quality_counter.most_common():
+            chip = QPushButton(f"{quality} ({count})")
             chip.setObjectName("specChip")
             chip.setCheckable(True)
+            chip.setChecked(self._filter_val == quality)
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            chip.setProperty("spec", spec)
+            chip.setProperty("spec", quality)
+            chip.clicked.connect(lambda checked=False, q=quality: self._apply_filter(q))
             self.spec_chips_layout.addWidget(chip)
+
+    def _apply_filter(self, quality: str):
+        """点击 chip 时调用：按 quality 过滤并重渲染。"""
+        self._filter_val = quality
+        # 更新 chip 选中态
+        for i in range(self.spec_chips_layout.count()):
+            item = self.spec_chips_layout.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                w.setChecked(w.property("spec") == quality)
+        # 重渲染
+        self._render_filtered_streams()
+
+    def _render_filtered_streams(self):
+        """按 _filter_val 过滤 _all_streams 后渲染。"""
+        if self._filter_val == "全部":
+            visible = self._all_streams
+        else:
+            visible = [
+                s for s in self._all_streams
+                if (s.get("quality") or "").strip() == self._filter_val
+            ]
+        # 同步 chip UI（保持 _apply_filter 和 render_streams 两条入口一致）
+        for i in range(self.spec_chips_layout.count()):
+            item = self.spec_chips_layout.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                w.setChecked(w.property("spec") == self._filter_val)
+        self._render_stream_cards(visible)
 
     def _render_stream_cards(self, streams: list):
         """渲染流卡片（单行布局）。"""

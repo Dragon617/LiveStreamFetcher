@@ -50,9 +50,8 @@ CORE_FUNCTIONS = {
     # YY直播核心
     "_yy_fetch_via_playwright",
     "fetch_yy_live",
-    # 本地代理（商业逻辑）
-    "LocalStreamProxy",
-    "_StreamProxyHTTPServer",
+    # 本地代理（保留类名混淆，参数名不混淆避免破坏调用方）
+    # LocalStreamProxy / _StreamProxyHTTPServer 不在白名单——类名依然混淆，参数名不混淆
     # 统一入口
     "extract_streams",
     # 启动流程
