@@ -4104,6 +4104,122 @@ PLATFORM_FETCHERS = {
 }
 
 
+# ═══════════════════════════════════════════════════════
+# Playwright 上下文生命周期管理
+# ═══════════════════════════════════════════════════════
+# _open_platform_in_chromium 启动的 persistent_context 都注册到这里，
+# EXE 退出时统一关闭，确保 Chromium 进程释放 _MEIPASS 临时目录的文件锁。
+
+_ACTIVE_PLAYWRIGHT_CONTEXTS = []
+
+
+def _cleanup_all_playwright_contexts():
+    """EXE 退出时统一关闭所有 Playwright 浏览器 context。
+
+    不调用的话：用户关闭主 EXE 时，Chromium 子进程仍持有 PyInstaller
+    onefile 临时目录 _MEIPASS/* 的文件句柄，导致退出时弹出
+    "Failed to remove temporary directory" 警告。
+    """
+    for ctx in list(_ACTIVE_PLAYWRIGHT_CONTEXTS):
+        try:
+            if hasattr(ctx, "browser") and ctx.browser is not None:
+                ctx.browser.close()   # 同步关闭，Chromium 进程会退出
+        except Exception:
+            pass
+    _ACTIVE_PLAYWRIGHT_CONTEXTS.clear()
+
+
+import atexit
+atexit.register(_cleanup_all_playwright_contexts)
+
+
+# ═══════════════════════════════════════════════════════
+# 平台浏览器数据目录 + 登录态注册表（共用一套 data_dir，
+# 点击平台 tab 启动登录浏览器、解析时启动解析浏览器，cookie 互通）
+# ═══════════════════════════════════════════════════════
+
+# 平台 key（Qt 版 PLATFORM_META 用） → (data_dir_func, login_check_func)
+_PLATFORM_BROWSER_MAP = {
+    "dy": (_get_dy_browser_data_dir, _check_dy_login_status),
+    "ks": (_get_ks_browser_data_dir, _check_ks_login_status),
+    "xhs": (_get_xhs_browser_data_dir, _check_xhs_login_status),
+    "tb": (_get_tb_browser_data_dir, _check_tb_login_status),
+    "yy": (_get_yy_browser_data_dir, None),
+}
+
+
+def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
+    """用对应平台的 persistent_context 浏览器打开 URL（与解析时的浏览器共享 cookie）。
+
+    用户点击平台 tab 时调用此函数 → 弹出嵌入式 Chromium（带 cookie 持久化）。
+    用户登录后关闭 → cookie 留在 data_dir。下次解析时（fetch_xxx 用同一 data_dir
+    启动浏览器）自动带上登录态，无需重复登录。
+
+    Args:
+        platform_key: 'dy' | 'ks' | 'xhs' | 'tb' | 'yy'
+        target_url: 目标 URL
+    """
+    if platform_key not in _PLATFORM_BROWSER_MAP:
+        return False
+    data_dir_func, _ = _PLATFORM_BROWSER_MAP[platform_key]
+    data_dir = data_dir_func()
+
+    def _launch():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return
+
+        # 抑制 Playwright 子进程弹出 CMD 黑窗口
+        if sys.platform == "win32":
+            _orig_popen = subprocess.Popen
+            def _no_console_popen(*args, **kwargs):
+                kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+                return _orig_popen(*args, **kwargs)
+            subprocess.Popen = _no_console_popen
+
+        # 强制解锁数据目录（防 SingletonLock 残留导致 about:blank）
+        _force_unlock_chromium_dir(data_dir)
+
+        try:
+            with sync_playwright() as p:
+                browser_path = _ensure_chromium_ready()
+                launch_kwargs = {
+                    "headless": False,
+                    "viewport": {"width": 1280, "height": 800},
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                }
+                if browser_path:
+                    launch_kwargs["executable_path"] = os.path.join(browser_path, "chrome.exe")
+                context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
+                # 注册到全局列表，EXE 退出时统一清理
+                _ACTIVE_PLAYWRIGHT_CONTEXTS.append(context)
+                # 关闭残留 about:blank
+                for existing_page in list(context.pages):
+                    try:
+                        existing_page.close()
+                    except Exception:
+                        pass
+                page = context.new_page() if not context.pages else context.pages[0]
+                # 跳转到目标 URL
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    try:
+                        page.goto(target_url, wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[{platform_key}] 浏览器启动失败: {e}")
+
+    threading.Thread(target=_launch, daemon=True).start()
+    return True
+
+
 # ─── yt-dlp 降级方案 ──────────────────────────────────────
 
 def fetch_streams_ytdlp(url: str, proxy: str = "") -> dict:

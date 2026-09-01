@@ -11,13 +11,22 @@ from PySide6.QtWidgets import (
     QPushButton, QLineEdit, QScrollArea, QGridLayout, QSizePolicy, QMenu,
     QMessageBox, QButtonGroup,
 )
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QIcon
 from PySide6.QtCore import QUrl
+
+import os
+import sys
 
 from .theme import Colors, PLATFORM_META
 from .widgets.stream_card import StreamCard
 from .controller import FetchWorker, LoginCheckWorker, ProxyStartWorker
 from .transcode_dialog import TranscodeDialog
+
+
+def _icon_path(relative: str) -> str:
+    """解析图标绝对路径（兼容开发模式 + PyInstaller onefile）。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, relative)
 
 
 class MainWindow(QMainWindow):
@@ -136,12 +145,21 @@ class MainWindow(QMainWindow):
         self._platform_btn_group = QButtonGroup(self)
         self._platform_btn_group.setExclusive(True)
         for key, meta in PLATFORM_META.items():
-            btn = QPushButton(f"{meta['icon']}  {meta['short']}")
+            btn = QPushButton(f"  {meta['short']}  ")
             btn.setObjectName("platformTab")
             btn.setCheckable(True)
             btn.setProperty("platform", key)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda checked, k=key: self._on_platform_clicked(k))
+
+            # 设置真实平台图标（来自用户提供的 PNG）
+            icon_path = _icon_path(meta.get("icon_path", ""))
+            if icon_path and os.path.exists(icon_path):
+                icon = QIcon(icon_path)
+                btn.setIcon(icon)
+                from PySide6.QtCore import QSize
+                btn.setIconSize(QSize(20, 20))
+
             self._platform_tabs[key] = btn
             self._platform_btn_group.addButton(btn)
             platform_row.addWidget(btn)
@@ -308,12 +326,32 @@ class MainWindow(QMainWindow):
         return bar
 
     # ═══════════════════════════════════════════════════
-    # 平台选择
+    # 平台选择（点击 tab → 用内置 Chromium 打开平台 URL）
     # ═══════════════════════════════════════════════════
     def _on_platform_clicked(self, key: str):
+        """点击平台 tab：用内置 persistent_context Chromium 打开平台 URL。
+        与解析流时共享同一 data_dir，登录后 cookie 自动复用，无需重复登录。"""
         self._selected_platform = key
         meta = PLATFORM_META[key]
         self.status_login.setText(f"{meta['short']}直播登录状态：检测中...")
+
+        target_url = meta.get("open_url")
+        if not target_url:
+            return
+
+        try:
+            from live_stream_fetcher import _open_platform_in_chromium
+            ok = _open_platform_in_chromium(key, target_url)
+            if ok:
+                self.status_login.setText(f"{meta['short']}直播登录状态：已打开内置浏览器")
+            else:
+                self.status_login.setText(f"{meta['short']}：未支持的内置浏览器打开")
+        except Exception as e:
+            # 业务层调用失败时兜底：用系统浏览器
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(target_url))
+            self.status_login.setText(f"内置浏览器启动失败，已用系统浏览器打开：{e}")
 
     # 平台官网 URL 映射
     _PLATFORM_URLS = {

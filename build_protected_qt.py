@@ -35,6 +35,11 @@ from PyInstaller.utils.hooks import collect_submodules
 
 datas = [
     (r'qt_app\styles.qss', 'qt_app'),
+    (r'{project_dir}\icons\dy_real.png', 'icons'),
+    (r'{project_dir}\icons\ks_real.png', 'icons'),
+    (r'{project_dir}\icons\tb_real.png', 'icons'),
+    (r'{project_dir}\icons\xhs_real.png', 'icons'),
+    (r'{project_dir}\icons\yy_real.png', 'icons'),
     (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     (r'{project_dir}\wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),

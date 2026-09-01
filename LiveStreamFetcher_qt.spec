@@ -29,7 +29,13 @@ hiddenimports = [
 
 # ── Qt 资源 + 嵌入式资源 ──
 datas = [
-    ('qt_app/styles.qss', 'qt_app'),   # QSS 样式表，保持相对路径
+    ('qt_app/styles.qss', 'qt_app'),
+    # 平台图标（5 个真实 PNG）
+    ('icons/dy_real.png', 'icons'),
+    ('icons/ks_real.png', 'icons'),
+    ('icons/tb_real.png', 'icons'),
+    ('icons/xhs_real.png', 'icons'),
+    ('icons/yy_real.png', 'icons'),
     # 嵌入式 Chromium（Playwright 浏览器，跨电脑分发不依赖系统浏览器）
     (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
     # 嵌入式 ffmpeg（HEVC 转码）

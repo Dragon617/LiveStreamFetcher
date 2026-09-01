@@ -67,6 +67,14 @@ def main():
         gate.verified.connect(window.show)
         gate.exec()
 
+    # 双保险：EXE 退出时主动关闭所有 Playwright 浏览器 context，
+    # 避免 Chromium 进程持有 PyInstaller 临时目录文件锁导致清理失败。
+    try:
+        from live_stream_fetcher import _cleanup_all_playwright_contexts
+        app.aboutToQuit.connect(_cleanup_all_playwright_contexts)
+    except Exception:
+        pass  # 业务层未加载时跳过（不影响 dev 模式）
+
     sys.exit(app.exec())
 
 
