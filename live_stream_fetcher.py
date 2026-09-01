@@ -6110,18 +6110,19 @@ def _find_ffmpeg() -> str:
 
 
 def _find_wechat_video_tool():
-    """查找微信视频号下载工具 EXE：便携目录 → _MEIPASS → AppData。"""
-    exe_name = "微信视频号下载工具2.6.exe"
+    """查找微信视频号下载工具 EXE：优先 2.8，回退 2.6。"""
+    candidates = ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe")
     exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 
-    for base in [exe_dir,
-                 os.path.join(sys._MEIPASS, "..") if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else "",
-                 os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")]:
-        if not base:
-            continue
-        p = os.path.join(base, "wechat_video_tool", exe_name)
-        if os.path.isfile(p):
-            return p
+    for exe_name in candidates:
+        for base in [exe_dir,
+                     os.path.join(sys._MEIPASS, "..") if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else "",
+                     os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")]:
+            if not base:
+                continue
+            p = os.path.join(base, "wechat_video_tool", exe_name)
+            if os.path.isfile(p):
+                return p
     return None
 
 
@@ -6133,15 +6134,22 @@ def _extract_embedded_wechat_video_tool():
     if not os.path.isdir(src_dir):
         return None
     dst_dir = os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher", "wechat_video_tool")
-    if os.path.isfile(os.path.join(dst_dir, "微信视频号下载工具2.6.exe")):
-        return os.path.join(dst_dir, "微信视频号下载工具2.6.exe")
+    # 检查已释放版本（任一版本即跳过）
+    for exe_name in ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe"):
+        cached = os.path.join(dst_dir, exe_name)
+        if os.path.isfile(cached):
+            return cached
     print("[视频号工具] 首次运行，正在释放到本地...")
     try:
         os.makedirs(dst_dir, exist_ok=True)
         shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
-        result = os.path.join(dst_dir, "微信视频号下载工具2.6.exe")
-        print(f"[视频号工具] 释放完成: {result}")
-        return result
+        # 返回找到的最高版本
+        for exe_name in ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe"):
+            p = os.path.join(dst_dir, exe_name)
+            if os.path.isfile(p):
+                print(f"[视频号工具] 释放完成: {p}")
+                return p
+        return None
     except Exception as e:
         print(f"[视频号工具] 释放失败: {e}")
         return None

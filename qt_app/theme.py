@@ -68,8 +68,8 @@ class Colors:
     STATUS_ERROR = "#ff6b6b"
 
 
-# ─── 平台元数据（用于平台卡片网格）───
-# 结构对齐 live_stream_fetcher.PLATFORM_META，保证数据一致
+# ─── 平台元数据（用于顶部横向 tab 选择）───
+# v8.2.8 设计：5 个解析平台横向 tab，视频号作为独立工具按钮（不在 tab 里）
 PLATFORM_META = {
     "dy": {
         "name": "抖音直播", "short": "抖音", "icon": "🎵",
@@ -77,16 +77,16 @@ PLATFORM_META = {
         "desc": "支持 live.douyin.com / douyin.com 多域名解析",
         "login": True,
     },
-    "ks": {
-        "name": "快手直播", "short": "快手", "icon": "📹",
-        "color": Colors.PLATFORM_KUAISHOU,
-        "desc": "支持 kuaishou.com 域名解析 · 需扫码登录",
-        "login": True,
-    },
     "xhs": {
         "name": "小红书直播", "short": "小红书", "icon": "📕",
         "color": Colors.PLATFORM_XHS,
         "desc": "支持 xhscdn.com 流地址 · HEVC 自动转码",
+        "login": True,
+    },
+    "ks": {
+        "name": "快手直播", "short": "快手", "icon": "📹",
+        "color": Colors.PLATFORM_KUAISHOU,
+        "desc": "支持 kuaishou.com 域名解析 · 需扫码登录",
         "login": True,
     },
     "tb": {
@@ -99,12 +99,6 @@ PLATFORM_META = {
         "name": "YY 直播", "short": "YY", "icon": "🎤",
         "color": Colors.PLATFORM_YY,
         "desc": "支持 www.yy.com / wap.yy.com 多端解析",
-        "login": False,
-    },
-    "wechat": {
-        "name": "视频号", "short": "视频号", "icon": "💬",
-        "color": Colors.PLATFORM_WECHAT,
-        "desc": "支持 channels.weixin.qq.com · 配合本地工具",
         "login": False,
     },
 }

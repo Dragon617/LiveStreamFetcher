@@ -34,9 +34,9 @@ datas = [
     (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
     # 嵌入式 ffmpeg（HEVC 转码）
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
-    # 微信视频号下载工具
-    (r'wechatVideoDownload2.6\微信视频号下载工具2.6.exe', 'wechat_video_tool'),
-    (r'wechatVideoDownload2.6\缓存', 'wechat_video_tool'),
+    # 微信视频号下载工具（2.8 版本）
+    (r'wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),
+    (r'wechatVideoDownload2.8\缓存', 'wechat_video_tool'),
 ]
 
 datas += collect_data_files('yt_dlp')

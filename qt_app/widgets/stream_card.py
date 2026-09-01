@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""stream_card.py — 单条直播流卡片组件"""
+"""stream_card.py — 单条直播流卡片（v8.2.8 单行布局）"""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QHBoxLayout, QLabel, QPushButton,
     QGraphicsDropShadowEffect,
 )
 from PySide6.QtGui import QColor
@@ -12,12 +12,12 @@ from ..theme import QUALITY_LEVELS, FORMAT_COLORS
 
 
 class StreamCard(QFrame):
-    """展示单条直播流，含复制 / OBS / 转码操作。"""
+    """单行布局：#序号 | 清晰度 | 规格 | 链接 | 复制链接 | 转码 | 来源"""
 
-    copyClicked = Signal(str)        # 复制 url
-    obsClicked = Signal(str)         # 复制代理 url
-    transcodeClicked = Signal(str)   # 转码 url
-    urlClicked = Signal(str)         # 点击 url 复制
+    copyClicked = Signal(str)
+    obsClicked = Signal(str)
+    transcodeClicked = Signal(str)
+    urlClicked = Signal(str)
 
     def __init__(self, stream: dict, index: int, platform: str = "", parent=None):
         super().__init__(parent)
@@ -28,9 +28,9 @@ class StreamCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(14)
-        shadow.setOffset(0, 2)
-        shadow.setColor(QColor(0, 0, 0, 70))
+        shadow.setBlurRadius(10)
+        shadow.setOffset(0, 1)
+        shadow.setColor(QColor(0, 0, 0, 50))
         self.setGraphicsEffect(shadow)
 
         self._build()
@@ -41,101 +41,83 @@ class StreamCard(QFrame):
         fmt = self.stream.get("format", "")
         source = self.stream.get("source", "")
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 10, 14, 10)
-        outer.setSpacing(6)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(8)
 
-        # ── 第一行：序号 + 清晰度 + 格式徽章 + 来源 ──
-        hdr = QHBoxLayout()
-        hdr.setSpacing(8)
-
+        # 1. 序号 #1
         idx = QLabel(f"#{self.index + 1}")
         idx.setObjectName("streamIndex")
-        hdr.addWidget(idx)
+        outer.addWidget(idx)
 
+        # 2. 清晰度（颜色）
         qual = QLabel(quality)
         qual.setObjectName("streamQuality")
         qual_color = self._quality_color(quality)
-        qual.setStyleSheet(f"color: {qual_color}; background: transparent;")
-        hdr.addWidget(qual)
+        qual.setStyleSheet(f"color: {qual_color}; background: transparent; font-weight: bold;")
+        outer.addWidget(qual)
 
+        # 分隔
+        outer.addWidget(self._sep())
+
+        # 3. 规格（FLV / M3U8）
         if fmt:
-            badge = QLabel(f"  {fmt.upper()}  ")
-            badge.setObjectName("fmtBadge")
-            badge.setStyleSheet(
-                f"background: {self._fmt_color(fmt)}; color: #fff; border-radius: 4px;"
-                f"padding: 1px 6px; font-size: 10px; font-weight: bold;"
+            fmt_lbl = QLabel(fmt.upper())
+            fmt_lbl.setStyleSheet(
+                f"color: {self._fmt_color(fmt)}; background: transparent; font-weight: bold;"
             )
-            hdr.addWidget(badge)
+            outer.addWidget(fmt_lbl)
 
-        hdr.addStretch(1)
+        # 分隔
+        outer.addWidget(self._sep())
 
-        if source and source != "INITIAL_DATA":
-            src = QLabel(f"来源: {source}")
-            src.setObjectName("streamIndex")
-            hdr.addWidget(src)
-
-        outer.addLayout(hdr)
-
-        # ── 第二行：URL ──
-        display = url if len(url) <= 90 else url[:87] + "..."
+        # 4. 链接（弹性宽度，带省略号）
+        display = url if len(url) <= 70 else url[:67] + "..."
         url_lbl = QLabel(display)
         url_lbl.setObjectName("streamUrl")
         url_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        url_lbl.setToolTip("点击复制完整链接")
-        outer.addWidget(url_lbl)
+        url_lbl.setToolTip(url)
+        outer.addWidget(url_lbl, 1)  # 弹性伸缩
 
-        # HEVC 提示
-        is_hevc = any(kw in quality.lower() for kw in ["hevc", "h265", "h.265"])
-        if is_hevc:
-            hint = QLabel("* 该链接为 HEVC 编码，无法直接在 OBS 使用，请点击「转码」按钮")
-            hint.setObjectName("streamHevcHint")
-            outer.addWidget(hint)
-
-        # ── 第三行：操作按钮 ──
-        btns = QHBoxLayout()
-        btns.setSpacing(8)
-
+        # 5. 复制链接（蓝色）
         cp = QPushButton("复制链接")
         cp.setObjectName("copyBtn")
         cp.setCursor(Qt.CursorShape.PointingHandCursor)
         cp.clicked.connect(lambda: self.copyClicked.emit(url))
-        btns.addWidget(cp)
+        outer.addWidget(cp)
 
-        # OBS 按钮（代理就绪时由外部更新）
+        # 6. OBS 按钮（代理就绪时显示）
         self.obs_btn = QPushButton("OBS")
         self.obs_btn.setObjectName("obsBtn")
         self.obs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.obs_btn.setVisible(False)
         self._proxy_url = None
         self.obs_btn.clicked.connect(self._on_obs_clicked)
-        btns.addWidget(self.obs_btn)
+        outer.addWidget(self.obs_btn)
 
-        # HLS/M3U8 非 HEVC → 绿色提示
-        fmt_lc = fmt.lower()
-        if not is_hevc and ("hls" in fmt_lc or "m3u8" in fmt_lc):
-            direct = QLabel(" 可直接在 OBS 使用 ")
-            direct.setStyleSheet(
-                "background: #2ea043; color: #fff; border-radius: 8px;"
-                "padding: 5px 12px; font-size: 12px;"
-            )
-            btns.addWidget(direct)
-
-        btns.addStretch(1)
-
-        # 转码按钮
+        # 7. 转码（灰色）
+        is_hevc = any(kw in quality.lower() for kw in ["hevc", "h265", "h.265"])
         trans = QPushButton("HEVC转码" if is_hevc else "转码")
         trans.setObjectName("transcodeBtn")
         trans.setCursor(Qt.CursorShape.PointingHandCursor)
         if is_hevc:
             trans.setStyleSheet(
-                "background: #8b5cf6; color: #fff; border: none; border-radius: 8px;"
-                "padding: 5px 14px; font-size: 12px; font-weight: bold;"
+                "background: #8b5cf6; color: #fff; border: none; border-radius: 6px;"
+                "padding: 3px 10px; font-size: 11px; font-weight: bold;"
             )
         trans.clicked.connect(lambda: self.transcodeClicked.emit(url))
-        btns.addWidget(trans)
+        outer.addWidget(trans)
 
-        outer.addLayout(btns)
+        # 8. 来源（"FLV 直播流"等）
+        if source and source != "INITIAL_DATA":
+            src = QLabel(f"来源: {source}")
+            src.setStyleSheet("color: #6a7390; background: transparent; font-size: 11px;")
+            outer.addWidget(src)
+
+    def _sep(self) -> QLabel:
+        sep = QLabel("|")
+        sep.setStyleSheet("color: #3a3158; background: transparent;")
+        return sep
 
     def _quality_color(self, quality: str) -> str:
         for code, label, color in QUALITY_LEVELS.values():
@@ -152,16 +134,8 @@ class StreamCard(QFrame):
         return "#6a7390"
 
     def set_obs_ready(self, proxy_url: str):
-        """代理就绪：显示 OBS 按钮并绑定代理地址。"""
         self._proxy_url = proxy_url
         self.obs_btn.setVisible(True)
 
     def _on_obs_clicked(self):
-        """点击 OBS 按钮：发射代理地址（无代理时回退原始 url）。"""
         self.obsClicked.emit(self._proxy_url or self.stream.get("url", ""))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            # 仅当点击的是 URL 区域时触发复制（简化：整卡复制）
-            self.urlClicked.emit(self.stream.get("url", ""))
-        super().mousePressEvent(event)
