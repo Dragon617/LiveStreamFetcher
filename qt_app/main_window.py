@@ -350,22 +350,28 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════
     def _on_platform_clicked(self, key: str):
         """点击平台 tab：用内置 persistent_context Chromium 打开平台 URL。
-        与解析流时共享同一 data_dir，登录后 cookie 自动复用，无需重复登录。"""
+        与解析流时共享同一 data_dir，登录后 cookie 自动复用，无需重复登录。
+
+        v8.3.6: 同步等待浏览器启动结果（最多 10s），把真实错误显示在状态栏。
+        之前是异步线程启动，UI 立即显示"已打开"，但实际 launch_persistent_context
+        失败被 except 静默吞掉 → 用户看到假"已打开"实际浏览器没启动。
+        """
         self._selected_platform = key
         meta = PLATFORM_META[key]
-        self.status_login.setText(f"{meta['short']}直播登录状态：检测中...")
+        self.status_login.setText(f"{meta['short']}直播登录状态：启动浏览器中...")
 
         target_url = meta.get("open_url")
         if not target_url:
+            self.status_login.setText(f"{meta['short']}：无内置浏览器打开 URL")
             return
 
         try:
             from live_stream_fetcher import _open_platform_in_chromium
-            ok = _open_platform_in_chromium(key, target_url)
+            ok, err = _open_platform_in_chromium(key, target_url)
             if ok:
                 self.status_login.setText(f"{meta['short']}直播登录状态：已打开内置浏览器")
             else:
-                self.status_login.setText(f"{meta['short']}：未支持的内置浏览器打开")
+                self.status_login.setText(f"{meta['short']}直播登录状态：浏览器启动失败 - {err}")
         except Exception as e:
             # 业务层调用失败时兜底：用系统浏览器
             from PySide6.QtGui import QDesktopServices

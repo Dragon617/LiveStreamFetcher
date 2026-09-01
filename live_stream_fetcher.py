@@ -4169,14 +4169,18 @@ _PLATFORM_BROWSER_SESSIONS = {}
 
 
 def _cleanup_all_playwright_contexts():
-    """EXE 退出时统一关闭所有 Playwright 浏览器 context。
+    """EXE 退出时统一关闭所有 Playwright 浏览器 context（含 Chromium 子进程）。
 
     不调用的话：
     1. 用户关闭主 EXE 时，Chromium 子进程仍持有 PyInstaller
        onefile 临时目录 _MEIPASS/* 的文件句柄，导致退出时弹出
        "Failed to remove temporary directory" 警告。
     2. Playwright driver 进程残留，可能端口冲突下次启动。
+
+    v8.3.6 修复：atexit 钩子末尾加 taskkill /F /IM chrome.exe，强制杀掉所有
+    Chromium 子进程（主/渲染/GPU/utility），彻底释放 _MEIPASS 临时目录文件锁。
     """
+    # 1. 优雅关闭 Playwright（关闭所有 context，停止 driver）
     for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
             _, ctx = entry
@@ -4192,6 +4196,20 @@ def _cleanup_all_playwright_contexts():
             pass
     _PLATFORM_BROWSER_RUNNERS.clear()
     _PLATFORM_BROWSER_SESSIONS.clear()
+
+    # 2. 强制 taskkill 残留 chrome.exe（关键：释放 _MEIPASS 临时目录文件锁）
+    #    ctx.close() 不等于 chrome.exe 完全退出，需要等子进程结束或强制 kill
+    import time as _time
+    _time.sleep(1.5)   # 给 Playwright 优雅关闭 1.5 秒
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                capture_output=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
 
 
 import atexit
@@ -4213,7 +4231,8 @@ _PLATFORM_BROWSER_MAP = {
 }
 
 
-def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
+def _open_platform_in_chromium(platform_key: str, target_url: str,
+                              wait_timeout: float = 10.0) -> tuple:
     """用对应平台的 persistent_context 浏览器打开 URL（与解析时的浏览器共享 cookie）。
 
     用户点击平台 tab 时调用此函数 → 弹出嵌入式 Chromium（带 cookie 持久化）。
@@ -4225,17 +4244,15 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                Playwright Sync API 的连接线程清理 → driver 进程被杀 → 浏览器闪退。
                现在让 _launch 阻塞直到浏览器窗口全部关闭。
     v8.3.5 修复：之前每次点击都 taskkill 现有窗口 + 重启浏览器 → 用户看到闪烁。
-               现在按 platform_key 维护 session：
-               - 已有该平台 session → 复用 context，在同一窗口 new_page() 新开 tab
-               - 没有该平台 session → 启动新 persistent_context（新窗口）
-               这样每次点击都"成功打开"，且同一窗口可累积多个 tab。
+               现在按 platform_key 维护 session。
+    v8.3.6 修复：之前 daemon thread 启动失败被 except 静默吞掉，状态栏假"已打开"。
+               现在同步等待启动结果（最多 10s），把真实错误返回给 UI。
 
-    Args:
-        platform_key: 'dy' | 'ks' | 'xhs' | 'tb' | 'yy'
-        target_url: 目标 URL
+    Returns:
+        (ok: bool, error_msg: str)
     """
     if platform_key not in _PLATFORM_BROWSER_MAP:
-        return False
+        return False, f"不支持的平台: {platform_key}"
 
     # v8.3.5: 已有 session → 复用 + 在同一窗口新开 tab（不再启动新窗口、不 taskkill）
     existing = _PLATFORM_BROWSER_SESSIONS.get(platform_key)
@@ -4251,19 +4268,25 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                 except Exception:
                     pass
             print(f"[{platform_key}] 复用现有浏览器窗口，新开 tab")
-            return True
+            return True, ""
         except Exception as e:
-            # session 已失效（context 关闭等）→ 清掉，重启
             print(f"[{platform_key}] session 失效 {e}，重新启动浏览器")
             _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
 
     data_dir_func, _ = _PLATFORM_BROWSER_MAP[platform_key]
     data_dir = data_dir_func()
 
+    # v8.3.6: 同步等待启动结果（之前直接 return True 让 UI 显示假"已打开"）
+    import threading as _threading
+    ready_event = _threading.Event()
+    result = {"ok": False, "error": "未启动"}
+
     def _launch():
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
+            result["error"] = "playwright 未安装"
+            ready_event.set()
             return
 
         # 抑制 Playwright 子进程弹出 CMD 黑窗口
@@ -4296,6 +4319,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
             _PLATFORM_BROWSER_RUNNERS.append((p, context))
             # 注册到 session 表（v8.3.5）
             _PLATFORM_BROWSER_SESSIONS[platform_key] = (p, context)
+            # 标记启动成功
+            result["ok"] = True
+            result["error"] = ""
+            ready_event.set()
 
             # 关闭残留 about:blank
             for existing_page in list(context.pages):
@@ -4322,23 +4349,27 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                         break
                     pages[0].wait_for_event("close", timeout=600000)   # 10 分钟超时
                 except Exception:
-                    # 任何异常（page 已被关、context 失效等）→ 检查是否还有 page
                     try:
                         if not context.pages:
                             break
                     except Exception:
                         break
         except Exception as e:
+            result["error"] = str(e)[:200]
+            ready_event.set()
             try:
                 print(f"[{platform_key}] 浏览器启动失败: {e}")
             except Exception:
                 pass
         finally:
-            # v8.3.5: session 结束（用户关完所有 tab）→ 清掉 session，下次点击会重启
             _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
 
-    threading.Thread(target=_launch, daemon=True).start()
-    return True
+    _threading.Thread(target=_launch, daemon=True).start()
+
+    # v8.3.6: 同步等待启动结果（最多 wait_timeout 秒）
+    if ready_event.wait(timeout=wait_timeout):
+        return result["ok"], result["error"]
+    return False, "浏览器启动超时"
 
 
 # ─── yt-dlp 降级方案 ──────────────────────────────────────
