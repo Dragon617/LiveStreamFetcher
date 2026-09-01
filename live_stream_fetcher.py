@@ -6113,10 +6113,11 @@ def _find_wechat_video_tool():
     """查找微信视频号下载工具 EXE：优先 2.8，回退 2.6。"""
     candidates = ("微信视频号下载工具2.8.exe", "微信视频号下载工具2.6.exe")
     exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    # _MEIPASS 本身（PyInstaller onefile 解压临时目录），不是 _MEIPASS/..
+    meipass_base = sys._MEIPASS if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else ""
 
     for exe_name in candidates:
-        for base in [exe_dir,
-                     os.path.join(sys._MEIPASS, "..") if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS') else "",
+        for base in [exe_dir, meipass_base,
                      os.path.join(os.environ.get("APPDATA", ""), "LiveStreamFetcher")]:
             if not base:
                 continue
