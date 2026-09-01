@@ -99,16 +99,16 @@ class MainWindow(QMainWindow):
         h.addWidget(title)
         h.addStretch(1)
 
-        # 右侧 v8.2.8 徽章
+        # 右侧 v8.2.8 徽章（深色背景，对齐 v8.2.8 截图）
         ver_badge = QLabel("v8.2.8")
         ver_badge.setStyleSheet(
-            f"font-size: 11px; color: {Colors.TEXT_PRIMARY};"
-            f"background: {Colors.BG_CARD}; border: 1px solid {Colors.BORDER};"
-            f"border-radius: 4px; padding: 2px 8px;"
+            f"font-size: 11px; color: #f0f4ff;"
+            f"background: #252b45; border: 1px solid #3a4258;"
+            f"border-radius: 4px; padding: 3px 10px;"
         )
         h.addWidget(ver_badge)
 
-        # 窗口控制：最小化 + 关闭
+        # 窗口控制：最小化 + 关闭（用 ASCII 字符确保字体支持）
         min_btn = QPushButton("—")
         min_btn.setObjectName("winCtrlBtn")
         min_btn.setFixedSize(28, 22)
@@ -116,7 +116,7 @@ class MainWindow(QMainWindow):
         min_btn.clicked.connect(self.showMinimized)
         h.addWidget(min_btn)
 
-        close_btn = QPushButton("✕")
+        close_btn = QPushButton("x")
         close_btn.setObjectName("winCloseBtn")
         close_btn.setFixedSize(28, 22)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
 
         # 获取流链接（金色）
-        self.fetch_btn = QPushButton("🔗 获取流链接")
+        self.fetch_btn = QPushButton("获取流链接")
         self.fetch_btn.setObjectName("fetchBtn")
         self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fetch_btn.setMinimumHeight(40)
@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.fetch_btn)
 
         # HEVC 转码（紫色）
-        self.transcode_top_btn = QPushButton("🔄 HEVC 转码")
+        self.transcode_top_btn = QPushButton("HEVC 转码")
         self.transcode_top_btn.setObjectName("transcodeTopBtn")
         self.transcode_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.transcode_top_btn.setMinimumHeight(40)
@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.transcode_top_btn)
 
         # 代理设置（蓝色）
-        self.proxy_btn = QPushButton("🌐 代理设置")
+        self.proxy_btn = QPushButton("代理设置")
         self.proxy_btn.setObjectName("proxyBtn")
         self.proxy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.proxy_btn.setMinimumHeight(40)
@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.proxy_btn)
 
         # 复制全部（蓝色）
-        self.copy_all_btn = QPushButton("📋 复制全部")
+        self.copy_all_btn = QPushButton("复制全部")
         self.copy_all_btn.setObjectName("copyAllBtn")
         self.copy_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_all_btn.setMinimumHeight(40)
@@ -215,7 +215,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.copy_all_btn)
 
         # 系统代理（青色）
-        self.sys_proxy_btn = QPushButton("⚙️ 系统代理")
+        self.sys_proxy_btn = QPushButton("系统代理")
         self.sys_proxy_btn.setObjectName("sysProxyBtn")
         self.sys_proxy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sys_proxy_btn.setMinimumHeight(40)
@@ -223,7 +223,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.sys_proxy_btn)
 
         # 视频号工具（绿色）
-        self.wechat_btn = QPushButton("💬 视频号工具")
+        self.wechat_btn = QPushButton("视频号工具")
         self.wechat_btn.setObjectName("wechatBtn")
         self.wechat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.wechat_btn.setMinimumHeight(40)
@@ -432,7 +432,7 @@ class MainWindow(QMainWindow):
         if expired:
             status = "已失效"
         elif online:
-            status = "已红绿"   # 截图里"已红绿"是"已登录"的口语化文案
+            status = "已登录"
         else:
             status = "未登录"
         self._set_login_status_label(key, status)

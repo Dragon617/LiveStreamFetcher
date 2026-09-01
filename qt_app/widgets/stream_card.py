@@ -95,16 +95,11 @@ class StreamCard(QFrame):
         self.obs_btn.clicked.connect(self._on_obs_clicked)
         outer.addWidget(self.obs_btn)
 
-        # 7. 转码（灰色）
+        # 7. 转码（灰色，对齐 v8.2.8 截图——不论是否 HEVC 都只显示"转码"）
         is_hevc = any(kw in quality.lower() for kw in ["hevc", "h265", "h.265"])
-        trans = QPushButton("HEVC转码" if is_hevc else "转码")
+        trans = QPushButton("转码")
         trans.setObjectName("transcodeBtn")
         trans.setCursor(Qt.CursorShape.PointingHandCursor)
-        if is_hevc:
-            trans.setStyleSheet(
-                "background: #8b5cf6; color: #fff; border: none; border-radius: 6px;"
-                "padding: 3px 10px; font-size: 11px; font-weight: bold;"
-            )
         trans.clicked.connect(lambda: self.transcodeClicked.emit(url))
         outer.addWidget(trans)
 
@@ -120,6 +115,15 @@ class StreamCard(QFrame):
         return sep
 
     def _quality_color(self, quality: str) -> str:
+        # v8.2.8 风格：FULL_HD1/HD1/SD1/SD2 → OR4/HD/SD
+        u = quality.upper()
+        if "FULL_HD" in u:
+            return QUALITY_LEVELS["OR4"][2]   # 橙色（原画）
+        if "HD" in u and "FULL" not in u:
+            return QUALITY_LEVELS["HD"][2]    # 绿色（高清）
+        if "SD" in u:
+            return QUALITY_LEVELS["SD"][2]    # 蓝色（标清）
+        # 常规匹配
         for code, label, color in QUALITY_LEVELS.values():
             if code.lower() in quality.lower() or label in quality:
                 return color

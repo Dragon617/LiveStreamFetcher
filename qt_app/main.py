@@ -27,14 +27,14 @@ def _load_stylesheet(app: QApplication) -> None:
 def _inject_demo_streams(window: MainWindow) -> None:
     """演示模式：注入 mock 流数据，用于预览 UI 视觉效果。"""
     demo = [
-        {"url": "https://live-source-play.xhscdn.com/live/stream_1080p_hevc.m3u8?token=abc123",
-         "quality": "1080p HEVC", "quality_tag": "OR4", "format": "m3u8", "source": "edith"},
-        {"url": "https://pull-flv-l1.douyincdn.com/live/stream_720p.flv?expire=123",
-         "quality": "720p 高清", "quality_tag": "HD", "format": "flv", "source": "douyin_api"},
-        {"url": "https://alivc-live.taobao.com/live/stream_sd.flv?auth_key=xyz",
-         "quality": "标清", "quality_tag": "SD", "format": "flv", "source": "mtop"},
-        {"url": "https://live-source-play-bak-tx.xhscdn.com/live/stream_1080p_h264.m3u8",
-         "quality": "原画", "quality_tag": "OR4", "format": "hls", "source": "edith"},
+        {"url": "https://live-source-play.xhscdn.com/live/stream_fullhd1.flv?token=abc123",
+         "quality": "FULL_HD1", "quality_tag": "OR4", "format": "FLV", "source": "edith"},
+        {"url": "https://pull-flv-l1.douyincdn.com/live/stream_hd1.flv?expire=123",
+         "quality": "HD1", "quality_tag": "HD", "format": "FLV", "source": "douyin_api"},
+        {"url": "https://alivc-live.taobao.com/live/stream_sd1.flv?auth_key=xyz",
+         "quality": "SD1", "quality_tag": "SD", "format": "FLV", "source": "mtop"},
+        {"url": "https://live-source-play-bak-tx.xhscdn.com/live/stream_sd2.m3u8",
+         "quality": "SD2", "quality_tag": "SD", "format": "m3u8", "source": "edith"},
     ]
     window.render_streams(demo, platform="小红书")
 
