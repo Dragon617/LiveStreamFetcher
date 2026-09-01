@@ -4330,6 +4330,8 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
 
     # v8.3.8: 已有共享浏览器 → 在同一窗口新开（不重启窗口、不 taskkill）
     # v8.3.9: new_page + goto 放进 daemon thread，主线程立即返回（流畅）
+    # v8.4.1: wait_until="commit" 优先（最快响应），失败再 fallback 到 load，
+    #           timeout 缩短到 15 秒（chrome 已运行，goto 不需要 30 秒）
     if _SHARED_BROWSER_SESSION is not None:
         try:
             _, browser, _, _ = _SHARED_BROWSER_SESSION
@@ -4338,11 +4340,14 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
             def _async_new_tab():
                 try:
                     page = context.new_page()
+                    page.set_default_navigation_timeout(15000)
                     try:
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                        # wait_until="commit" = 收到 HTTP 响应即可（最快）
+                        page.goto(target_url, wait_until="commit", timeout=15000)
                     except Exception:
                         try:
-                            page.goto(target_url, wait_until="commit", timeout=15000)
+                            # fallback: 等到 load 事件（页面资源加载完成）
+                            page.goto(target_url, wait_until="load", timeout=15000)
                         except Exception:
                             pass
                 except Exception as e:
@@ -4394,6 +4399,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     # 启动 chrome.exe（单进程，5 个平台共用）
     # v8.3.10: 不要 --no-startup-window（否则 chrome 不开窗口导致用户看不到）。
     #           带 target_url 作为初始 tab，CDP 接管后**复用初始 tab**（避免双 tab）。
+    # v8.4.1: 去掉 --no-sandbox（chrome 145+ 标记为不支持命令行标记，触发警告条
+    #           "您使用的不受支持的命令行标记"，可能影响新 tab 渲染稳定性）和
+    #           --disable-features=Translate（副作用）。保留 --no-sandbox 改成
+    #           --disable-blink-features=AutomationControlled（让 webdriver=undefined）。
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4401,9 +4410,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         "--remote-debugging-address=127.0.0.1",
         "--no-first-run",
         "--no-default-browser-check",
-        "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=Translate",
         target_url,
     ]
     creation_flags = 0
