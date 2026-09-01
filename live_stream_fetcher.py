@@ -4214,9 +4214,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
     用户登录后关闭 → cookie 留在 data_dir。下次解析时（fetch_xxx 用同一 data_dir
     启动浏览器）自动带上登录态，无需重复登录。
 
-    v8.3.1 修复：之前用 `with sync_playwright() as p:` 上下文管理器，函数返回时
-    p 自动 stop() 会关闭所有 persistent_context —— 用户看到的"闪退"。
-    现在改为手动 start()，driver + 浏览器一起常驻，EXE 退出时才清理。
+    v8.3.1 修复：去掉 `with sync_playwright()` 上下文（函数返回时 p.stop() 会杀浏览器）
+    v8.3.4 修复：之前 daemon thread 函数体执行完 `page.goto` 后立即返回 → thread 退出 →
+               Playwright Sync API 的连接线程清理 → driver 进程被杀 → 浏览器闪退。
+               现在让 _launch 阻塞直到浏览器窗口全部关闭。
 
     Args:
         platform_key: 'dy' | 'ks' | 'xhs' | 'tb' | 'yy'
@@ -4277,6 +4278,22 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
                     page.goto(target_url, wait_until="commit", timeout=15000)
                 except Exception:
                     pass
+
+            # v8.3.4: 阻塞直到浏览器窗口关闭
+            # daemon thread 函数体如果立即返回，Playwright Sync API 的连接线程会被
+            # 清理，driver 进程被杀掉，浏览器窗口一闪就消失（用户看到的"闪退"）。
+            # 这里阻塞等到所有 page 都关闭：
+            while True:
+                try:
+                    pages = list(context.pages)
+                    if not pages:
+                        # 浏览器窗口全关了
+                        break
+                    # 用 wait_for_event 阻塞等待首个 page 关闭事件
+                    pages[0].wait_for_event("close", timeout=600000)   # 10 分钟超时
+                except Exception:
+                    # 任何异常（page 已被关、context 失效等）→ 退出循环
+                    break
         except Exception as e:
             try:
                 print(f"[{platform_key}] 浏览器启动失败: {e}")
