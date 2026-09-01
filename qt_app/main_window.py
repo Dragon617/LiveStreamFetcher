@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QButtonGroup,
 )
 from PySide6.QtGui import QColor, QDesktopServices, QIcon
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QDateTime, QTimer
 
 import os
 import sys
@@ -48,13 +48,25 @@ class MainWindow(QMainWindow):
         self._proxy_worker = None
         self._card_by_url = {}
 
-        # 累计访问次数（mock 展示，真实环境可对接后端）
-        self._visit_count = 105432
-        self._start_date = "2024-06-25"
+        # 累计访问次数（v8.3.1：每次启动 +1，持久化到 %APPDATA%/LiveStreamFetcher/visit_count.json）
+        try:
+            from live_stream_fetcher import bump_visit_count_on_startup
+            self._visit_count = bump_visit_count_on_startup()
+        except Exception:
+            # EXE/打包环境 fallback：不让缺这个库就把 UI 卡死
+            self._visit_count = 0
 
         self._build_ui()
         self.fetchRequested.connect(self._start_fetch)
         self._start_login_checks()
+
+        # v8.3.1：状态栏日期 1 分钟刷新一次（实时显示）
+        self._date_timer = QTimer(self)
+        self._date_timer.setInterval(60 * 1000)
+        self._date_timer.timeout.connect(self._refresh_status_date)
+        self._date_timer.start()
+        # 首帧立即刷新一次
+        QTimer.singleShot(0, self._refresh_status_date)
 
     # ═══════════════════════════════════════════════════
     # UI 构建（单栏布局）
@@ -313,17 +325,25 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
 
-        # 右侧：日期 | 累计访问次数
-        self.status_visit = QLabel(
-            f"日期：{self._start_date} | 累计访问次数：{self._visit_count:,}"
-        )
+        # 右侧：日期 | 累计访问次数（v8.3.1：实时日期，持久化累计值）
+        self.status_visit = QLabel()
         self.status_visit.setObjectName("statusVisit")
         self.status_visit.setStyleSheet(
             f"font-size: 12px; color: {Colors.TEXT_SECONDARY}; background: transparent;"
         )
         h.addWidget(self.status_visit)
+        # 立即填充（_refresh_status_date 也会调一次）
+        self._refresh_status_date()
 
         return bar
+
+    # ── 状态栏日期 / 访问次数更新（v8.3.1）─────────────────
+    def _refresh_status_date(self):
+        """每分钟由定时器触发；显示真实系统日期。"""
+        today = QDateTime.currentDateTime().toString("yyyy-MM-dd")
+        self.status_visit.setText(
+            f"日期：{today} | 累计访问次数：{self._visit_count:,}"
+        )
 
     # ═══════════════════════════════════════════════════
     # 平台选择（点击 tab → 用内置 Chromium 打开平台 URL）

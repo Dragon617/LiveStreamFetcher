@@ -4092,6 +4092,52 @@ def _clear_system_proxy() -> None:
 
 
 # ═══════════════════════════════════════════════════════
+# 累计访问次数持久化（v8.3.1）
+# ═══════════════════════════════════════════════════════
+# 之前硬编码 105432，每次启动都显示假数字。现在写到
+# %APPDATA%/LiveStreamFetcher/visit_count.json 持久化计数，
+# 跨版本累计，启动时 +1。
+def _get_visit_count_path() -> str:
+    import os as _os
+    base = _os.environ.get("APPDATA") or _os.path.expanduser("~")
+    folder = _os.path.join(base, "LiveStreamFetcher")
+    try:
+        _os.makedirs(folder, exist_ok=True)
+    except Exception:
+        pass
+    return _os.path.join(folder, "visit_count.json")
+
+
+def _load_visit_count() -> int:
+    """读取累计访问次数，文件不存在/格式错返回 0。"""
+    import json as _json
+    p = _get_visit_count_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+            return int(data.get("count", 0))
+    except Exception:
+        return 0
+
+
+def _save_visit_count(n: int) -> None:
+    import json as _json
+    p = _get_visit_count_path()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump({"count": n}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def bump_visit_count_on_startup() -> int:
+    """启动时调用：累加 1 并返回最新值。"""
+    n = _load_visit_count() + 1
+    _save_visit_count(n)
+    return n
+
+
+# ═══════════════════════════════════════════════════════
 # 平台解析器注册表
 # ═══════════════════════════════════════════════════════
 
@@ -4110,23 +4156,36 @@ PLATFORM_FETCHERS = {
 # _open_platform_in_chromium 启动的 persistent_context 都注册到这里，
 # EXE 退出时统一关闭，确保 Chromium 进程释放 _MEIPASS 临时目录的文件锁。
 
-_ACTIVE_PLAYWRIGHT_CONTEXTS = []
+# 长生命周期 Playwright runner 列表：(p, context) 对
+# 之前用 with sync_playwright() as p 上下文管理器，函数返回时 p 自动 stop()
+# 会强制关闭所有 persistent_context 浏览器（也就是用户看到的"闪退"）。
+# 正确做法：手动 start()，让 driver 与浏览器一起驻留，EXE 退出时再统一 stop。
+_PLATFORM_BROWSER_RUNNERS = []
 
 
 def _cleanup_all_playwright_contexts():
     """EXE 退出时统一关闭所有 Playwright 浏览器 context。
 
-    不调用的话：用户关闭主 EXE 时，Chromium 子进程仍持有 PyInstaller
-    onefile 临时目录 _MEIPASS/* 的文件句柄，导致退出时弹出
-    "Failed to remove temporary directory" 警告。
+    不调用的话：
+    1. 用户关闭主 EXE 时，Chromium 子进程仍持有 PyInstaller
+       onefile 临时目录 _MEIPASS/* 的文件句柄，导致退出时弹出
+       "Failed to remove temporary directory" 警告。
+    2. Playwright driver 进程残留，可能端口冲突下次启动。
     """
-    for ctx in list(_ACTIVE_PLAYWRIGHT_CONTEXTS):
+    for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
-            if hasattr(ctx, "browser") and ctx.browser is not None:
-                ctx.browser.close()   # 同步关闭，Chromium 进程会退出
+            _, ctx = entry
+            if ctx is not None:
+                ctx.close()
         except Exception:
             pass
-    _ACTIVE_PLAYWRIGHT_CONTEXTS.clear()
+        try:
+            p, _ = entry
+            if p is not None:
+                p.stop()
+        except Exception:
+            pass
+    _PLATFORM_BROWSER_RUNNERS.clear()
 
 
 import atexit
@@ -4155,6 +4214,10 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
     用户登录后关闭 → cookie 留在 data_dir。下次解析时（fetch_xxx 用同一 data_dir
     启动浏览器）自动带上登录态，无需重复登录。
 
+    v8.3.1 修复：之前用 `with sync_playwright() as p:` 上下文管理器，函数返回时
+    p 自动 stop() 会关闭所有 persistent_context —— 用户看到的"闪退"。
+    现在改为手动 start()，driver + 浏览器一起常驻，EXE 退出时才清理。
+
     Args:
         platform_key: 'dy' | 'ks' | 'xhs' | 'tb' | 'yy'
         target_url: 目标 URL
@@ -4182,39 +4245,43 @@ def _open_platform_in_chromium(platform_key: str, target_url: str) -> bool:
         _force_unlock_chromium_dir(data_dir)
 
         try:
-            with sync_playwright() as p:
-                browser_path = _ensure_chromium_ready()
-                launch_kwargs = {
-                    "headless": False,
-                    "viewport": {"width": 1280, "height": 800},
-                    "args": [
-                        "--no-sandbox",
-                        "--disable-gpu",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                }
-                if browser_path:
-                    launch_kwargs["executable_path"] = os.path.join(browser_path, "chrome.exe")
-                context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
-                # 注册到全局列表，EXE 退出时统一清理
-                _ACTIVE_PLAYWRIGHT_CONTEXTS.append(context)
-                # 关闭残留 about:blank
-                for existing_page in list(context.pages):
-                    try:
-                        existing_page.close()
-                    except Exception:
-                        pass
-                page = context.new_page() if not context.pages else context.pages[0]
-                # 跳转到目标 URL
+            p = sync_playwright().start()   # 手动 start()，不退出 = 不杀浏览器
+            browser_path = _ensure_chromium_ready()
+            launch_kwargs = {
+                "headless": False,
+                "viewport": {"width": 1280, "height": 800},
+                "args": [
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            if browser_path:
+                launch_kwargs["executable_path"] = os.path.join(browser_path, "chrome.exe")
+            context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
+            # 注册到长生命周期列表，EXE 退出时统一清理
+            _PLATFORM_BROWSER_RUNNERS.append((p, context))
+
+            # 关闭残留 about:blank
+            for existing_page in list(context.pages):
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    existing_page.close()
                 except Exception:
-                    try:
-                        page.goto(target_url, wait_until="commit", timeout=15000)
-                    except Exception:
-                        pass
+                    pass
+            page = context.new_page() if not context.pages else context.pages[0]
+            # 跳转到目标 URL
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                try:
+                    page.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"[{platform_key}] 浏览器启动失败: {e}")
+            try:
+                print(f"[{platform_key}] 浏览器启动失败: {e}")
+            except Exception:
+                pass
 
     threading.Thread(target=_launch, daemon=True).start()
     return True
