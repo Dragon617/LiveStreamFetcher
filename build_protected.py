@@ -386,14 +386,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v7.6.39',
+    name='LiveStreamFetcher_v8.2.8',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,          # 不显示 CMD 窗口（正式版）
+    console=True,           # v8.2.4 显示 CMD 窗口（让用户看到 print 输出确认 click 触发）
     disable_windowed_traceback=True,   # 禁用错误追踪弹窗
     argv_emulation=False,
     target_arch=None,
@@ -462,14 +462,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LiveStreamFetcher_v7.6.39_plain',
+    name='LiveStreamFetcher_v8.2.8_plain',
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,            # v8.2.4 显示 CMD 窗口
     disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
@@ -518,12 +518,12 @@ def build_plain():
                 print(f"      ERR: {line[:200]}")
         return None
 
-    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v7.6.39_plain.exe")
+    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v8.2.8_plain.exe")
     if os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
         print(f"      未加密版打包成功: {size_mb:.1f} MB")
         # 复制到项目 dist 目录
-        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v7.6.39_plain.exe")
+        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v8.2.8_plain.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)
@@ -625,13 +625,13 @@ def main():
         size_plain = os.path.getsize(plain_path) / (1024 * 1024)
         print(f"  [A] 未加密版: {plain_path} ({size_plain:.1f} MB)")
 
-    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v7.6.39.exe")
+    output_exe = os.path.join(BUILD_DIR, "dist", "LiveStreamFetcher_v8.2.8.exe")
     protected_ok = False
     if os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
         print(f"  [B] 加密版:   {output_exe} ({size_mb:.1f} MB)")
         # 复制到项目 dist 目录
-        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v7.6.39.exe")
+        project_dist = os.path.join(PROJECT_DIR, "dist", "LiveStreamFetcher_v8.2.8.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)

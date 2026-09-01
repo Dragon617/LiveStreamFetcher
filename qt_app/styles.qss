@@ -1,0 +1,506 @@
+/* ============================================================
+   LiveStreamFetcher Qt 版 — 全局样式表
+   深色玻璃感 · 圆角仪表盘风格（对齐 live_stream_fetcher.Colors）
+   ============================================================ */
+
+/* ---------- 全局基础 ---------- */
+QWidget {
+    background: transparent;
+    color: #f0f4ff;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+}
+
+QMainWindow, QDialog {
+    background: #0a0e1a;
+}
+
+QToolTip {
+    background: #161b2e;
+    color: #f0f4ff;
+    border: 1px solid #2a3148;
+    padding: 6px 10px;
+    border-radius: 6px;
+}
+
+/* ---------- 侧边栏 ---------- */
+#sidebar {
+    background: #0d1117;
+    border-right: 1px solid #1a2030;
+}
+
+#logoTitle {
+    font-size: 16px;
+    font-weight: bold;
+    color: #f0f4ff;
+}
+
+#logoSubtitle {
+    font-size: 11px;
+    color: #6a7390;
+}
+
+#sideMenuBtn {
+    background: transparent;
+    color: #9aa3bd;
+    border: none;
+    border-radius: 10px;
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 13px;
+}
+
+#sideMenuBtn:hover {
+    background: #161b2e;
+    color: #f0f4ff;
+}
+
+#sideMenuBtn[active="true"] {
+    background: #1f2540;
+    color: #00d4ff;
+    font-weight: bold;
+}
+
+/* ---------- 顶部标题栏 ---------- */
+#topbar {
+    background: transparent;
+    border-bottom: 1px solid #1a2030;
+}
+
+#pageTitle {
+    font-size: 18px;
+    font-weight: bold;
+    color: #f0f4ff;
+}
+
+#pageSubtitle {
+    font-size: 12px;
+    color: #6a7390;
+}
+
+/* ---------- Hero 渐变区 ---------- */
+#hero {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #00d4ff, stop:0.5 #2f7fe0, stop:1 #5b8def);
+    border-radius: 18px;
+}
+
+#heroTitle {
+    font-size: 22px;
+    font-weight: bold;
+    color: #ffffff;
+    background: transparent;
+}
+
+#heroDesc {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.9);
+    background: transparent;
+}
+
+#heroStatValue {
+    font-size: 20px;
+    font-weight: bold;
+    color: #ffffff;
+    background: transparent;
+}
+
+#heroStatLabel {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.8);
+    background: transparent;
+}
+
+/* ---------- 区块标题 ---------- */
+#sectionTitle {
+    font-size: 16px;
+    font-weight: bold;
+    color: #f0f4ff;
+}
+
+#sectionHint {
+    font-size: 11px;
+    color: #6a7390;
+}
+
+/* ---------- 平台卡片 ---------- */
+#platformCard {
+    background: #161b2e;
+    border: 1px solid #2a3148;
+    border-radius: 14px;
+}
+
+#platformCard:hover {
+    background: #1f2540;
+    border: 1px solid #3a4258;
+}
+
+#platformCard[selected="true"] {
+    background: #1f2540;
+    border: 1px solid #58a6ff;
+}
+
+#platformIcon {
+    background: transparent;
+    font-size: 24px;
+}
+
+#platformName {
+    background: transparent;
+    font-size: 14px;
+    font-weight: bold;
+    color: #f0f4ff;
+}
+
+#platformDesc {
+    background: transparent;
+    font-size: 11px;
+    color: #6a7390;
+}
+
+#platformStatus {
+    background: transparent;
+    font-size: 10px;
+    color: #10b981;
+}
+
+/* ---------- 输入区 ---------- */
+#inputCard {
+    background: #161b2e;
+    border: 1px solid #2a3148;
+    border-radius: 14px;
+}
+
+#urlInput {
+    background: #0f1422;
+    color: #f0f4ff;
+    border: 1px solid #2a3148;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 13px;
+    selection-background-color: #58a6ff;
+    selection-color: #ffffff;
+}
+
+#urlInput:focus {
+    border: 1px solid #58a6ff;
+}
+
+#urlInput::placeholder {
+    color: #6a7390;
+}
+
+/* ---------- 按钮 ---------- */
+/* 主按钮（金色） */
+QPushButton#primaryBtn {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFE55C, stop:1 #FFD700);
+    color: #0a0e1a;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 22px;
+    font-weight: bold;
+    font-size: 13px;
+}
+
+QPushButton#primaryBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFEE88, stop:1 #FFE055);
+}
+
+QPushButton#primaryBtn:pressed {
+    background: #D4A017;
+}
+
+QPushButton#primaryBtn:disabled {
+    background: #3a4258;
+    color: #6a7390;
+}
+
+/* 次按钮（描边） */
+QPushButton#ghostBtn {
+    background: transparent;
+    color: #9aa3bd;
+    border: 1px solid #3a4258;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-size: 13px;
+}
+
+QPushButton#ghostBtn:hover {
+    background: #1f2540;
+    color: #f0f4ff;
+    border: 1px solid #58a6ff;
+}
+
+QPushButton#ghostBtn:pressed {
+    background: #252b45;
+}
+
+/* 强调按钮（蓝） */
+QPushButton#accentBtn {
+    background: #58a6ff;
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-weight: bold;
+    font-size: 13px;
+}
+
+QPushButton#accentBtn:hover {
+    background: #6cb2ff;
+}
+
+QPushButton#accentBtn:pressed {
+    background: #4a90d9;
+}
+
+/* 危险按钮（红） */
+QPushButton#dangerBtn {
+    background: #ff6b6b;
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-weight: bold;
+}
+
+QPushButton#dangerBtn:hover {
+    background: #ff8585;
+}
+
+/* 小图标按钮 */
+QPushButton#iconBtn {
+    background: transparent;
+    color: #9aa3bd;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+QPushButton#iconBtn:hover {
+    background: #1f2540;
+    color: #f0f4ff;
+}
+
+/* ---------- 结果区 ---------- */
+#resultPanel {
+    background: transparent;
+}
+
+/* 筛选标签（chip） */
+QPushButton#filterChip {
+    background: #161b2e;
+    color: #9aa3bd;
+    border: 1px solid #2a3148;
+    border-radius: 16px;
+    padding: 6px 16px;
+    font-size: 12px;
+}
+
+QPushButton#filterChip:hover {
+    background: #1f2540;
+    color: #f0f4ff;
+}
+
+QPushButton#filterChip:checked {
+    background: #1f2540;
+    color: #00d4ff;
+    border: 1px solid #58a6ff;
+}
+
+/* 流卡片 */
+#streamCard {
+    background: #161b2e;
+    border: 1px solid #2a3148;
+    border-radius: 12px;
+}
+
+#streamCard:hover {
+    background: #1f2540;
+    border: 1px solid #3a4258;
+}
+
+#streamIndex {
+    background: transparent;
+    font-size: 12px;
+    font-weight: bold;
+    color: #6a7390;
+}
+
+#streamQuality {
+    background: transparent;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+#streamUrl {
+    background: transparent;
+    font-size: 12px;
+    color: #8b949e;
+    font-family: "Consolas", "Courier New", monospace;
+}
+
+#streamHevcHint {
+    background: transparent;
+    font-size: 11px;
+    color: #ef4444;
+}
+
+/* 格式徽章 */
+#fmtBadge {
+    background: #22c55e;
+    color: #ffffff;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: bold;
+}
+
+/* 小按钮（复制/OBS/转码） */
+QPushButton#copyBtn {
+    background: #58a6ff;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+QPushButton#copyBtn:hover {
+    background: #6cb2ff;
+}
+
+QPushButton#obsBtn {
+    background: #ff5000;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+QPushButton#obsBtn:hover {
+    background: #e64a00;
+}
+
+QPushButton#transcodeBtn {
+    background: #6b7280;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+QPushButton#transcodeBtn:hover {
+    background: #9ca3af;
+}
+
+/* ---------- 状态栏 ---------- */
+#statusBar {
+    background: #0d1117;
+    border-top: 1px solid #1a2030;
+}
+
+#statusDot {
+    background: transparent;
+    font-size: 12px;
+    color: #6a7390;
+}
+
+#statusText {
+    background: transparent;
+    font-size: 12px;
+    color: #9aa3bd;
+}
+
+#authorLabel {
+    background: transparent;
+    font-size: 11px;
+    color: #6a7390;
+}
+
+/* ---------- 滚动条 ---------- */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: #2a3148;
+    border-radius: 4px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #3a4258;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #2a3148;
+    border-radius: 4px;
+    min-width: 30px;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+/* ---------- 空态占位 ---------- */
+#placeholderTitle {
+    font-size: 16px;
+    font-weight: bold;
+    color: #6a7390;
+}
+
+#placeholderDesc {
+    font-size: 12px;
+    color: #4a5268;
+}
+
+/* ---------- 菜单 ---------- */
+QMenu {
+    background: #161b2e;
+    color: #f0f4ff;
+    border: 1px solid #2a3148;
+    border-radius: 8px;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 8px 24px;
+    border-radius: 6px;
+}
+
+QMenu::item:selected {
+    background: #1f2540;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #2a3148;
+    margin: 4px 8px;
+}

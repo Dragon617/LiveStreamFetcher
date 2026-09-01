@@ -548,6 +548,138 @@ def _ensure_chromium_ready():
     return None
 
 
+def _force_unlock_chromium_dir(user_data_dir):
+    """v8.0.2 强制解锁 Chromium user_data_dir（防 about:blank）。
+
+    当内置浏览器已经打开时，再启动 Playwright persistent_context 会因
+    SingletonLock 被占用而失败，导致新 chromium 卡在 about:blank。
+
+    本函数：
+    1. 用 PowerShell 查找占用 user_data_dir 的 chrome.exe 进程并 taskkill
+    2. 等 1.5 秒让进程退出
+    3. 删除 SingletonLock / SingletonCookie / SingletonSocket 等锁文件
+    """
+    import subprocess
+    import time
+
+    if not user_data_dir:
+        return
+
+    abs_dir = os.path.abspath(user_data_dir)
+    ps_path = abs_dir.replace("\\", "\\\\")
+
+    try:
+        ps_script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+            "Where-Object { $_.CommandLine -and ($_.CommandLine -like '*" + ps_path + "*') } | "
+            "ForEach-Object { $_.ProcessId }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        killed = 0
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", line],
+                        capture_output=True, timeout=5,
+                    )
+                    killed += 1
+                except Exception:
+                    pass
+        if killed:
+            print("[ChromiumUnlock] 关闭了 {} 个占用 {} 的 chrome.exe".format(killed, os.path.basename(user_data_dir)))
+            time.sleep(1.5)
+    except Exception:
+        pass
+
+    for lock_name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+        for sub in ["", os.path.join("Default", "")]:
+            lock_path = os.path.join(user_data_dir, sub, lock_name) if sub else os.path.join(user_data_dir, lock_name)
+            if os.path.isfile(lock_path):
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+
+
+# 快手"请求过快"风控指数退避表（秒）
+# 短退避失败后会逐渐拉长等待时间，避免无效刷新触发更严的封禁
+_KS_RATE_LIMIT_BACKOFF = [8, 15, 25, 35, 45]
+# 最大自动重试次数（避免一直刷新导致用户等待过久）
+_KS_RATE_LIMIT_MAX_RETRIES = 5
+
+
+def _ks_detect_rate_limit(page, result_data):
+    """综合检测快手"请求过快"风控
+
+    改进点（v8.x）：
+    - 原来只检测 SSR state 里的 errorType.type，截图中的页面错误只在 DOM 中显示
+    - 现在综合三种来源：SSR state、页面 DOM 文本、网络响应中的 errorType
+
+    Returns:
+        None: 未检测到风控
+        tuple(source, err_type, detail): 检测到风控
+            source: 'state' / 'dom' / 'network'
+            err_type: 错误类型编号（state/network）或 DOM 关键词
+            detail: 额外描述
+    """
+    # 方式1：检查 SSR state 里的 errorType
+    try:
+        state = page.evaluate("""() => {
+            if (window.__INITIAL_STATE__) return window.__INITIAL_STATE__;
+            return null;
+        }""")
+        if state:
+            playlist = state.get("liveroom", {}).get("playList", [])
+            if playlist:
+                err = playlist[0].get("errorType") or {}
+                if err.get("type"):
+                    return ("state", err.get("type"), err.get("text") or err.get("message") or "")
+    except Exception:
+        pass
+
+    # 方式2：检查页面 DOM 中的"请求过快"等关键词（截图中最常见的情况）
+    # 错误只在客户端 hydrate 后通过 API 返回并渲染到 DOM，但 __INITIAL_STATE__ 仍是旧值
+    try:
+        dom_keyword = page.evaluate("""() => {
+            const body = (document.body && document.body.innerText) || '';
+            // 快手常见的风控文案关键词
+            const keywords = ['请求过快', '请稍后重试', '操作过于频繁', '访问频率', '刷新重试', '网络异常'];
+            for (const k of keywords) {
+                if (body.indexOf(k) !== -1) return k;
+            }
+            return '';
+        }""")
+        if dom_keyword:
+            return ("dom", "", dom_keyword)
+    except Exception:
+        pass
+
+    # 方式3：检查已经拦截到的网络响应里是否带 errorType
+    try:
+        for _resp_url, data in (result_data or {}).items():
+            if not isinstance(data, dict):
+                continue
+            err = data.get("errorType") or {}
+            if err.get("type"):
+                return ("network", err.get("type"), _resp_url[:120])
+            # 兜底：响应里直接有 result/errno 但没有 liveStream
+            result_code = data.get("result")
+            if result_code not in (None, 1, "1"):
+                # 同时没有 playUrls 才算真正的风控（避免误判普通业务错误）
+                ls = data.get("liveStream") or (data.get("data") or {}).get("liveStream")
+                if not (ls and isinstance(ls, dict) and ls.get("playUrls")):
+                    return ("network", result_code, _resp_url[:120])
+    except Exception:
+        pass
+
+    return None
+
+
 def _ks_fetch_via_playwright(url, room_id):
     """通过 Playwright 浏览器自动化获取快手直播流（风控降级方案）
 
@@ -576,6 +708,7 @@ def _ks_fetch_via_playwright(url, room_id):
 
             # ── 浏览器启动参数（所有方式共用）──
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -586,7 +719,8 @@ def _ks_fetch_via_playwright(url, room_id):
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -596,6 +730,8 @@ def _ks_fetch_via_playwright(url, room_id):
 
             # 方式1: 嵌入式 Chromium（打包在 EXE 中，首次运行释放到 AppData）
             embedded_chromium = _ensure_chromium_ready()
+            # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+            _force_unlock_chromium_dir(user_data_dir)
             if embedded_chromium:
                 try:
                     print(f"[Playwright] 使用嵌入式 Chromium: {embedded_chromium}")
@@ -649,6 +785,7 @@ def _ks_fetch_via_playwright(url, room_id):
             """)
 
             result_data = {}
+            rate_limit_retry_count = 0  # "请求过快"风控自动重试次数
 
             def on_response(response):
                 resp_url = response.url
@@ -833,6 +970,66 @@ def _ks_fetch_via_playwright(url, room_id):
 
                 # 检查页面状态
                 if "captcha" not in page.url.lower():
+                    # ── 综合检测"请求过快"风控（DOM / SSR / 网络响应三个来源）──
+                    rate_limit_info = _ks_detect_rate_limit(page, result_data)
+                    if rate_limit_info:
+                        source, err_type, detail = rate_limit_info
+                        rate_limit_retry_count += 1
+                        if rate_limit_retry_count > _KS_RATE_LIMIT_MAX_RETRIES:
+                            print(
+                                f"[Playwright] '请求过快'风控已重试 {_KS_RATE_LIMIT_MAX_RETRIES} 次仍失败，"
+                                f"放弃自动重试（来源={source}，type={err_type}）"
+                            )
+                            # 跳出当前内层逻辑，让外层主循环自然结束
+                            break
+
+                        # 指数退避：8, 15, 25, 35, 45 秒 + 抖动
+                        backoff_idx = min(rate_limit_retry_count - 1, len(_KS_RATE_LIMIT_BACKOFF) - 1)
+                        wait_sec = _KS_RATE_LIMIT_BACKOFF[backoff_idx] + random.randint(0, 3)
+                        print(
+                            f"[Playwright] 检测到风控 [来源={source}, type={err_type}, 详情={detail}]"
+                            f"，第 {rate_limit_retry_count}/{_KS_RATE_LIMIT_MAX_RETRIES} 次重试，"
+                            f"等待 {wait_sec} 秒后刷新..."
+                        )
+                        page.wait_for_timeout(wait_sec * 1000)
+                        page.reload(wait_until="domcontentloaded", timeout=30000)
+                        result_data.clear()
+                        prev_url["value"] = page.url
+
+                        # 刷新后立即检测一次，若还在风控就提前进入下一轮（不再空等 4 轮）
+                        for _j in range(3):
+                            page.wait_for_timeout(5000)
+                            # 先看有没有数据
+                            found_stream = False
+                            for resp_url, data in result_data.items():
+                                if isinstance(data, dict):
+                                    _ls = data.get("liveStream")
+                                    if not _ls:
+                                        _dd = data.get("data", {})
+                                        if isinstance(_dd, dict):
+                                            _ls = _dd.get("liveStream")
+                                    if _ls and isinstance(_ls, dict) and _ls.get("playUrls"):
+                                        _streams = _ks_parse_playurls_adaptation(_ls.get("playUrls"))
+                                        if not _streams:
+                                            _streams = _ks_parse_livestream(_ls)
+                                        if _streams:
+                                            context.close()
+                                            return {
+                                                "platform": "快手",
+                                                "title": _ls.get("userEid", room_id),
+                                                "uploader": _ls.get("userEid", room_id),
+                                                "is_live": True,
+                                                "streams": _streams,
+                                                "method": "Playwright浏览器解析",
+                                            }
+                            # 再确认是否还在风控
+                            if _ks_detect_rate_limit(page, result_data):
+                                # 仍处于风控，跳出这一段回到主循环（主循环会再次退避+刷新）
+                                print("[Playwright] 刷新后仍处于风控状态，继续等待下一轮...")
+                                break
+                        continue  # 回到主循环下一轮
+
+                    # ── 正常路径：从 SSR state 提取直播流 ──
                     state = page.evaluate("""() => {
                         if (window.__INITIAL_STATE__) return window.__INITIAL_STATE__;
                         return null;
@@ -841,45 +1038,7 @@ def _ks_fetch_via_playwright(url, room_id):
                         playlist = state.get("liveroom", {}).get("playList", [])
                         if playlist:
                             item = playlist[0]
-                            err = item.get("errorType") or {}
                             ls = item.get("liveStream", {})
-
-                            # 检测到"请求过快"风控，自动等待后刷新重试
-                            if err.get("type"):
-                                err_type = err.get("type")
-                                print(f"[Playwright] 检测到风控 errorType={err_type}")
-                                # 等待 3~5 秒后自动刷新页面
-                                wait_sec = random.randint(3, 5)
-                                print(f"[Playwright] 等待 {wait_sec} 秒后自动刷新页面...")
-                                page.wait_for_timeout(wait_sec * 1000)
-                                page.reload(wait_until="domcontentloaded", timeout=30000)
-                                result_data.clear()
-                                prev_url["value"] = page.url
-                                # 刷新后再等一轮让数据加载
-                                for _j in range(4):
-                                    page.wait_for_timeout(5000)
-                                    for resp_url, data in result_data.items():
-                                        if isinstance(data, dict):
-                                            _ls = data.get("liveStream")
-                                            if not _ls:
-                                                _dd = data.get("data", {})
-                                                if isinstance(_dd, dict):
-                                                    _ls = _dd.get("liveStream")
-                                            if _ls and isinstance(_ls, dict) and _ls.get("playUrls"):
-                                                _streams = _ks_parse_playurls_adaptation(_ls.get("playUrls"))
-                                                if not _streams:
-                                                    _streams = _ks_parse_livestream(_ls)
-                                                if _streams:
-                                                    context.close()
-                                                    return {
-                                                        "platform": "快手",
-                                                        "title": _ls.get("userEid", room_id),
-                                                        "uploader": _ls.get("userEid", room_id),
-                                                        "is_live": True,
-                                                        "streams": _streams,
-                                                        "method": "Playwright浏览器解析",
-                                                    }
-                                continue  # 如果刷新后仍无数据，继续主循环等待
 
                             if ls and isinstance(ls, dict) and ls.get("playUrls"):
                                 streams = _ks_parse_playurls_adaptation(ls.get("playUrls"))
@@ -1415,6 +1574,7 @@ def _dy_fetch_via_playwright(url: str) -> dict:
 
             # ── 浏览器启动参数 ──
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -1429,7 +1589,8 @@ def _dy_fetch_via_playwright(url: str) -> dict:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 ),
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -1438,6 +1599,8 @@ def _dy_fetch_via_playwright(url: str) -> dict:
             context = None
 
             embedded_chromium = _ensure_chromium_ready()
+            # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+            _force_unlock_chromium_dir(user_data_dir)
             if embedded_chromium:
                 try:
                     print(f"[抖音Playwright] 使用嵌入式 Chromium: {embedded_chromium}")
@@ -1474,7 +1637,13 @@ def _dy_fetch_via_playwright(url: str) -> dict:
                 print(f"[抖音Playwright] 无法启动浏览器: {'; '.join(launch_errors)}")
                 return None
 
-            page = context.pages[0] if context.pages else context.new_page()
+            # v8.2.5 修复：new_page() 失败时降级到 API 方式
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+            except Exception as e_newpage:
+                print(f"[抖音Playwright] new_page() 失败: {e_newpage}（chromium 可能未正常启动）")
+                context.close()
+                return None
 
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -2136,6 +2305,7 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
             print(f"[小红书Playwright] 使用浏览器缓存目录: {user_data_dir}")
 
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -2146,7 +2316,8 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -2154,6 +2325,8 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
             context = None
 
             embedded_chromium = _ensure_chromium_ready()
+            # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+            _force_unlock_chromium_dir(user_data_dir)
             if embedded_chromium:
                 try:
                     print(f"[小红书Playwright] 使用嵌入式 Chromium: {embedded_chromium}")
@@ -2910,6 +3083,7 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
             print(f"[淘宝Playwright] 使用浏览器缓存目录: {user_data_dir}")
 
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -2920,7 +3094,8 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -2928,6 +3103,8 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
             context = None
 
             embedded_chromium = _ensure_chromium_ready()
+            # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+            _force_unlock_chromium_dir(user_data_dir)
             if embedded_chromium:
                 try:
                     print(f"[淘宝Playwright] 使用嵌入式 Chromium: {embedded_chromium}")
@@ -3454,6 +3631,7 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
             print(f"[YY Playwright] 使用浏览器缓存目录: {user_data_dir}")
 
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -3464,7 +3642,8 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -3472,6 +3651,8 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
             context = None
 
             embedded_chromium = _ensure_chromium_ready()
+            # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+            _force_unlock_chromium_dir(user_data_dir)
             if embedded_chromium:
                 try:
                     print(f"[YY Playwright] 使用嵌入式 Chromium: {embedded_chromium}")
@@ -4142,6 +4323,7 @@ class Colors:
     BG_CARD_HOVER = "#252b45"    # 卡片 hover
     BG_INPUT = "#0f1422"         # 输入框背景
     BG_BORDER = "#2a3148"        # 卡片边框
+    BG_HOVER = "#1f2540"          # 通用 hover 背景（v8.0.2 补充）
 
     # ── 边框 ──
     BORDER = "#2a3148"           # 默认边框（柔和）
@@ -4327,13 +4509,43 @@ class RoundedFrame(tk.Frame):
             )
 
     def configure(self, **kw):
+        # v8.2.7 修复：处理 _PressButton3D 自定义参数，
+        # 避免传给 tk.Frame.configure 触发 Tcl "unknown option" 错误
+        if "text" in kw:
+            self._set_text(kw.pop("text"))
+        if "icon_text" in kw:
+            new_icon_text = kw.pop("icon_text")
+            if getattr(self, '_icon_id', None) is not None and not self._icon_path:
+                try:
+                    self._canvas.itemconfigure(self._icon_id, text=new_icon_text)
+                    self._icon_text = new_icon_text
+                except Exception:
+                    pass
         if "bg" in kw:
-            self._fill_color = kw.pop("bg")
-            self._redraw()
-        if "border" in kw:
-            self._border_color = kw.pop("border")
-            self._redraw()
-        super().configure(**kw)
+            self._color_top = kw.pop("bg")  # v8.2.7: bg 实际就是 color_top
+            try:
+                self._canvas.itemconfigure("top", fill=self._color_top)
+            except Exception:
+                pass
+        if "color_top" in kw:
+            self._color_top = kw.pop("color_top")
+            try:
+                self._canvas.itemconfigure("top", fill=self._color_top)
+            except Exception:
+                pass
+        if "color_bottom" in kw:
+            self._color_bottom = kw.pop("color_bottom")
+            try:
+                self._canvas.itemconfigure("3d", fill=self._color_bottom)
+            except Exception:
+                pass
+        if kw:
+            # 还有未处理的参数，安全地传给 super
+            try:
+                super().configure(**kw)
+            except Exception:
+                # 静默忽略 Frame 不支持的参数
+                pass
 
 
 class RoundedButton(tk.Canvas):
@@ -4676,15 +4888,25 @@ class _PressButton3D(tk.Frame):
             # 默认 state='normal'（始终显示）
         )
 
-        # 事件绑定
+        # 事件绑定（v8.2.1 双保险：tag_bind + canvas 全局 bind）
+        # tag_bind 只在点击 item 区域时触发，Python 3.14 tkinter 有
+        # 偶发问题导致 tag_bind 不响应；额外加 canvas.bind 兜底
         for tag in ("3d", "top", "icon", "text"):
             self._canvas.tag_bind(tag, '<Enter>', self._on_enter)
             self._canvas.tag_bind(tag, '<Leave>', self._on_leave)
             self._canvas.tag_bind(tag, '<Button-1>', self._on_press)
             self._canvas.tag_bind(tag, '<ButtonRelease-1>', self._on_release)
+        # v8.2.1 额外把事件绑到整个 canvas（不依赖任何 tag）
+        self._canvas.bind('<Button-1>', self._on_press)
+        self._canvas.bind('<ButtonRelease-1>', self._on_release)
         # 确保在顶层
         self._canvas.tag_raise("text")
         self._canvas.tag_raise("icon")
+        # v8.2.0 修复：删除 self._canvas.lift()（Python 3.14 tkinter bug
+        # lift() 不传参数时 tk.call('raise', self._w, None) 会被传字符串
+        # "None" 给 Tcl，导致 wrong # args 异常，整个 _PressButton3D
+        # 构造失败，按钮行后续 UI 全部丢失。
+        # tag_raise 已足够把 text/icon 提到 canvas 上层，无需再 lift canvas）
 
     def _on_enter(self, _=None):
         self._hovered = True
@@ -4711,6 +4933,10 @@ class _PressButton3D(tk.Frame):
             self._canvas.move("icon", 0, -3)
 
     def _on_press(self, _=None):
+        # v8.2.1 修复：canvas.bind + tag_bind 会重复触发，
+        # 必须检查 _pressed 防止文字/icon 下移超过 3px
+        if self._pressed:
+            return
         self._pressed = True
         # 3D 底边消失（覆盖整个高度）
         self._canvas.coords("3d",
@@ -6579,7 +6805,7 @@ class LiveStreamFetcherApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("影视匠直播流获取 v7.6.39 — by LONGSHAO")
+        self.root.title("影视匠直播流获取 v8.2.8 — by LONGSHAO")
         self.root.geometry("900x700")  # v7.6.25 缩小窗口
         self.root.minsize(800, 620)
         self.root.configure(bg=Colors.BG_DARK)
@@ -6758,9 +6984,9 @@ class LiveStreamFetcherApp:
                 bg=Colors.BG_DARK, fg=Colors.GOLD_PRIMARY
             ).pack(side="left", padx=(14, 0), pady=16)
 
-        # 右侧装饰：版本号
+        # 右侧装饰：版本号（v8.2.7 同步）
         tk.Label(
-            bar, text="v7.6", font=("Microsoft YaHei UI", 9),
+            bar, text="v8.2.8", font=("Microsoft YaHei UI", 9),
             bg=Colors.BG_DARK, fg=Colors.GOLD_PRIMARY
         ).pack(side="right", padx=(0, 4), pady=22)
 
@@ -7240,7 +7466,7 @@ class LiveStreamFetcherApp:
 
         # 右侧：访客计数（金色）
         self._visitor_count_label = tk.Label(
-            status, text="本软件已访问 加载中…",
+            status, text="本软件已访问 -- 次",  # v8.0.2 占位文本，避免一直显示"加载中"
             font=("Microsoft YaHei UI", 9),
             bg=Colors.BG_SIDEBAR, fg=Colors.GOLD_PRIMARY, cursor="hand2",
         )
@@ -7320,8 +7546,8 @@ class LiveStreamFetcherApp:
             ".b3c6c3d569de54420449a20254382ae6"
         )
 
-        # 延迟 8 秒再启动浏览器，让主界面先完全加载（不阻塞启动）
-        time.sleep(8)
+        # v8.0.2 缩短到 2 秒（主界面已先渲染，再等也意义不大）
+        time.sleep(2)
 
         def _update_label(text):
             try:
@@ -7362,10 +7588,10 @@ class LiveStreamFetcherApp:
                     page.goto(widget_url, wait_until="domcontentloaded", timeout=20000)
                 except Exception:
                     pass
-                time.sleep(3)  # 等 JS 渲染
+                time.sleep(1)  # v8.0.2 缩短到 1 秒（widget 渲染通常很快）
 
                 # 用 JS 直接提取访客数字（比截图快 100 倍）
-                _update_label("本软件已访问 加载中...")
+                # 初始 label 已经是 "-- 次"，无需中间更新
                 for attempt in range(3):
                     try:
                         count = page.evaluate("""() => {
@@ -7422,22 +7648,44 @@ class LiveStreamFetcherApp:
     # ─── 浏览器调用 ───
     @staticmethod
     def _open_url_with_chromium(url):
-        """使用项目封装的 Chromium 浏览器打开 URL，失败则降级到系统浏览器"""
+        """v8.0.2 使用项目封装的 Chromium 浏览器打开 URL，加固容错。
+        
+        健壮性：
+        1. 优先用项目内置 chrome.exe（带 no-sandbox / no-gpu）
+        2. 失败时降级到系统默认浏览器
+        3. 任何阶段失败都有兜底，绝不静默吞错
+        """
         import subprocess
-        chrome_exe = _ensure_chromium_ready()
-        if chrome_exe:
-            exe_path = os.path.join(chrome_exe, "chrome.exe")
-            if os.path.isfile(exe_path):
-                try:
-                    subprocess.Popen(
-                        [exe_path, "--no-first-run", "--no-default-browser-check", url],
-                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-                    )
-                    return
-                except Exception:
-                    pass
-        # 降级到系统默认浏览器
-        __import__("webbrowser").open(url)
+        try:
+            chrome_exe = _ensure_chromium_ready()
+            if chrome_exe:
+                exe_path = os.path.join(chrome_exe, "chrome.exe")
+                if os.path.isfile(exe_path):
+                    try:
+                        subprocess.Popen(
+                            [exe_path, "--no-first-run", "--no-default-browser-check",
+                             "--no-sandbox", "--disable-gpu",
+                             "--disable-software-rasterizer", url],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+                        )
+                        print(f"[内置浏览器] 已启动: {url}")
+                        return
+                    except Exception as e:
+                        print(f"[内置浏览器] Popen 失败: {e}")
+        except Exception as e:
+            print(f"[内置浏览器] _ensure_chromium_ready 失败: {e}")
+
+        try:
+            import webbrowser
+            if webbrowser.open(url):
+                print(f"[系统浏览器] 已打开: {url}")
+            else:
+                print(f"[系统浏览器] webbrowser.open 返回 False: {url}")
+        except Exception as e:
+            print(f"[系统浏览器] 也失败: {e}")
 
     def _open_persistent_url(self, platform_key: str, url: str, login_url: str = ""):
         """用对应平台的 persistent_context 浏览器打开 URL（与登录状态共用一份数据）。
@@ -7496,26 +7744,40 @@ class LiveStreamFetcherApp:
 
             subprocess.Popen = _no_console_popen
 
+        # v8.0.2 强制解锁用户数据目录，避免已开浏览器时启动失败导致 about:blank
+        _force_unlock_chromium_dir(data_dir)
+
         try:
             with sync_playwright() as p:
                 browser_path = _ensure_chromium_ready()
                 launch_kwargs = {
                     "headless": False,
                     "viewport": {"width": 1280, "height": 800},
-                    "user_data_dir": data_dir,
                     "args": ["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
                 }
                 if browser_path:
                     launch_kwargs["executable_path"] = os.path.join(browser_path, "chrome.exe")
-
-                context = p.chromium.launch_persistent_context(**launch_kwargs)
+                # v8.2.0 修复：user_data_dir 必须作为位置参数传给 launch_persistent_context，
+                # 否则会在 **kwargs 中被当作首次位置参数，导致 chromium 重复接收 user_data_dir
+                # 并把 data_dir 字符串当成独立参数，导致 "unknown option" 错误
+                context = p.chromium.launch_persistent_context(data_dir, **launch_kwargs)
                 # launch_persistent_context 已经返回一个 context，直接用
-                if context.pages:
-                    page = context.pages[0]
+                # v8.0.2 关闭所有现有标签页（包括残留的 about:blank），确保干净状态
+                for existing_page in list(context.pages):
+                    try:
+                        existing_page.close()
+                    except Exception:
+                        pass
+                page = context.new_page() if not context.pages else context.pages[0]
+                # page.goto 加 try/except 容错
+                try:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                else:
-                    page = context.new_page()
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print(f"[{platform_key}] page.goto 失败: {e}")
+                    try:
+                        page.goto(target_url, wait_until="commit", timeout=15000)
+                    except Exception as e2:
+                        print(f"[{platform_key}] goto 重试也失败: {e2}")
 
                 # 保持打开，用户手动关闭
                 # context.close() 不会自动调用（让用户继续使用）
@@ -7980,6 +8242,7 @@ class LiveStreamFetcherApp:
 
             # 准备启动参数
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -7990,7 +8253,8 @@ class LiveStreamFetcherApp:
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -8001,6 +8265,8 @@ class LiveStreamFetcherApp:
                 # 尝试启动浏览器
                 context = None
                 embedded_chromium = _ensure_chromium_ready()
+                # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+                _force_unlock_chromium_dir(user_data_dir)
                 if embedded_chromium:
                     try:
                         context = p.chromium.launch_persistent_context(
@@ -8185,6 +8451,7 @@ class LiveStreamFetcherApp:
             url = "https://www.douyin.com"
 
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -8199,7 +8466,8 @@ class LiveStreamFetcherApp:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 ),
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -8209,6 +8477,8 @@ class LiveStreamFetcherApp:
             with sync_playwright() as p:
                 context = None
                 embedded_chromium = _ensure_chromium_ready()
+                # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+                _force_unlock_chromium_dir(user_data_dir)
                 if embedded_chromium:
                     try:
                         context = p.chromium.launch_persistent_context(
@@ -8437,6 +8707,7 @@ class LiveStreamFetcherApp:
 
             # 准备启动参数
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -8447,7 +8718,8 @@ class LiveStreamFetcherApp:
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -8458,6 +8730,8 @@ class LiveStreamFetcherApp:
                 # 尝试启动浏览器
                 context = None
                 embedded_chromium = _ensure_chromium_ready()
+                # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+                _force_unlock_chromium_dir(user_data_dir)
                 if embedded_chromium:
                     try:
                         context = p.chromium.launch_persistent_context(
@@ -8636,6 +8910,7 @@ class LiveStreamFetcherApp:
 
             # 准备启动参数
             launch_args = [
+                "--no-sandbox",  # v8.2.4 必须带，沙箱缺失会导致 Windows 上启动失败
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -8646,7 +8921,8 @@ class LiveStreamFetcherApp:
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
             }
 
@@ -8657,6 +8933,8 @@ class LiveStreamFetcherApp:
                 # 尝试启动浏览器
                 context = None
                 embedded_chromium = _ensure_chromium_ready()
+                # v8.0.2 关闭旧 chromium 进程，避免 about:blank
+                _force_unlock_chromium_dir(user_data_dir)
                 if embedded_chromium:
                     try:
                         context = p.chromium.launch_persistent_context(
@@ -8830,15 +9108,24 @@ class LiveStreamFetcherApp:
 
     # ─── 获取按钮 ───
     def _on_fetch(self):
+        # v8.2.6 修复：让用户看到 click 触发了
+        print("[v8.2.8] _on_fetch clicked!", flush=True)
+        self._show_toast("已点击获取流链接，正在解析...")
+        # v8.2.6 修复：立刻修改按钮文字（不管后续是否成功）
+        try:
+            self.fetch_btn.configure(text="  解析中...  ", bg=Colors.GOLD_DARK)
+        except Exception:
+            pass
         url = self.url_var.get().strip()
         if not url:
-            self._show_toast("请先粘贴直播间链接")
+            self._show_toast("❌ 请先粘贴直播间链接")
+            self._show_toast_long("请先粘贴直播间链接", 5000)
             return
         if not url.startswith("http"):
-            self._show_toast("请输入有效的 HTTP/HTTPS 链接")
+            self._show_toast(f"❌ 缺 https:// 前缀（当前: {url[:30]}...）")
+            self._show_toast_long("请输入完整的 HTTP/HTTPS 链接（以 https:// 开头）", 5000)
             return
 
-        self.fetch_btn.configure(text="  解析中...  ", bg=Colors.GOLD_DARK)
         self.status_var.set("正在解析视频流，请稍候...")
         self.status_icon.configure(fg=Colors.ACCENT_ORANGE)
 
@@ -8847,17 +9134,29 @@ class LiveStreamFetcherApp:
 
     # ─── 后台获取流数据（在线程中运行） ───
     def _do_fetch(self, url: str):
-        """后台线程：解析直播流并更新 UI"""
+        """v8.2.4 后台线程：解析直播流并更新 UI"""
+        print(f"[v8.2.8] _do_fetch starting, url={url[:80]}", flush=True)
         try:
             result = extract_streams(url, proxy="")
+            print(f"[v8.2.8] extract_streams returned, streams={len(result.get('streams', []))}", flush=True)
             # 切回主线程更新 UI
             self.root.after(0, lambda: self._show_result(result))
         except Exception as e:
+            import traceback
+            err_full = traceback.format_exc()
+            print(f"[v8.2.8] _do_fetch EXCEPTION:\n{err_full}", flush=True)
             _err_msg = str(e)
             self.root.after(0, lambda: self._show_error(_err_msg))
         finally:
-            self.root.after(0, lambda: self.fetch_btn.configure(
-                text="  解析  ", bg=Colors.ACCENT_GREEN))
+            # v8.2.7 修复：延迟 1.5 秒恢复按钮文字，让用户能看到"解析中..."状态
+            def _restore():
+                try:
+                    if self.fetch_btn.winfo_exists():
+                        self.fetch_btn.configure(
+                            text="  获取流链接  ", bg=Colors.ACCENT_GREEN)
+                except Exception:
+                    pass
+            self.root.after(1500, _restore)
 
     # ─── 显示解析结果 ───
     def _show_result(self, result: dict):
@@ -9733,7 +10032,7 @@ class LiveStreamFetcherApp:
 
     # ─── Toast 提示 ───
     def _show_toast(self, message: str):
-        """底部弹出提示"""
+        """底部弹出提示（2 秒）"""
         toast = tk.Label(
             self.root, text=f"  {message}  ",
             font=("Microsoft YaHei UI", 10),
@@ -9742,6 +10041,17 @@ class LiveStreamFetcherApp:
         )
         toast.place(relx=0.5, rely=0.92, anchor="center")
         self.root.after(2000, toast.destroy)
+
+    def _show_toast_long(self, message: str, duration_ms: int = 5000):
+        """底部弹出长提示（5 秒），用于错误说明。"""
+        toast = tk.Label(
+            self.root, text=f"  {message}  ",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            bg=Colors.ACCENT_RED, fg="white",
+            padx=18, pady=8,
+        )
+        toast.place(relx=0.5, rely=0.85, anchor="center")
+        self.root.after(duration_ms, toast.destroy)
 
     # ─── 清空结果 ───
     def _clear_result(self):
@@ -10134,6 +10444,8 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
 
                 # 优先嵌入式 Chromium
                 embedded_chromium = _ensure_chromium_ready()
+                # v8.2.8 修复：密码抓取是无状态 headless 单次启动（无 persistent_context），
+                # 不使用 user_data_dir。移除 v8.0.2 误粘贴的 unlock 调用（原 user_data_dir 从未赋值）
                 if embedded_chromium:
                     try:
                         browser = p.chromium.launch(
