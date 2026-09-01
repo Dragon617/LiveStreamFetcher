@@ -22,6 +22,18 @@ pyi_error.txt
 pyi_normal_v515.txt
 pyarmor.bug.log
 
+# 调试/测试脚本和截图（不推送）
+_patch_*.py
+_rewrite_*.py
+_test_*.py
+_preview_v76.py
+test_*.png
+v76_*.png
+preview_v76*.png
+v8_*.png
+qt_app/_preview*.png
+_preview_*.png
+
 # PyInstaller 构建产物
 build/
 dist/
@@ -45,10 +57,11 @@ test_visitor.png
 # WorkBuddy 内部配置（不推送到公开仓库）
 .workbuddy/
 
-# 微信视频下载工具（子仓库/二进制工具，单独管理）
+# 微信视频下载工具（子仓库/二进制工具，单独管理；EXE 内部已嵌入打包）
 wechatVideoDownload_ref/
 wechatVideoDownload2.6/
 wechatVideoDownload2.6.zip
+wechatVideoDownload2.8/
 
 # ZIP 压缩包
 *.zip
