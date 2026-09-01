@@ -4380,12 +4380,17 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
             p = sync_playwright().start()
             # launch_persistent_context：Playwright 用自家 driver 启动 chrome
             # 不用 subprocess.Popen + CDP，避免 CDP 干扰 chrome 原生 tab 行为
+            # v8.4.6: launch_persistent_context 报"Executable doesn't exist at chromium-1234"
+            #   因为我们打的是 chromium-1208 而 Playwright 1.62 内部期望 chromium-1234。
+            #   用 executable_path 强制使用我们 embedded 的 chromium-1208。
             # v8.4.5: launch_persistent_context 不允许 args 里带 URL（"Arguments can
-            # not specify page to be opened"）。先启动 chrome，复用初始 New Tab Page
-            # 用 pages[0].goto(target_url) 跳转，避免双 tab。
+            #   not specify page to be opened"）。先启动 chrome，复用初始 New Tab Page
+            #   用 pages[0].goto(target_url) 跳转，避免双 tab。
+            _chrome_exe_path = os.path.join(browser_path, "chrome.exe")
             context = p.chromium.launch_persistent_context(
                 user_data_dir=data_dir,
                 headless=False,
+                executable_path=_chrome_exe_path,
                 viewport={"width": 1280, "height": 800},
                 args=[
                     "--no-first-run",
