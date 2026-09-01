@@ -4159,18 +4159,18 @@ _PLATFORM_BROWSER_RUNNERS = []
 # 用于复用同一个浏览器窗口：再次点击同一平台 tab 时直接 new_page() 新开 tab，
 # 不再启动新浏览器窗口、不再 taskkill 用户的现有窗口。
 # v8.3.7: 改为 (p, browser, chrome_proc) 三元组，CDP 连接 + 自己启动的 chrome.exe
-_PLATFORM_BROWSER_SESSIONS = {}
+# v8.3.8: 删除多 session 模式 → 所有平台共用一个 chrome.exe + 单 CDP 端口（9222）
+#           一个 user-data-dir，cookie 按 URL 域名自动隔离（不同平台不同域）
+#           所有 tab 在同一个浏览器窗口（用户期望体验）
+_PLATFORM_BROWSER_SESSIONS = {}   # 保留占位但不再使用（兼容旧调用）
 
-# v8.3.7: 给每个平台分配固定 CDP 调试端口
-# 用 subprocess.Popen 启动 chrome.exe + --remote-debugging-port=N
-# Playwright 用 connect_over_cdp("http://127.0.0.1:N") 连接控制
-_CDP_PORT_MAP = {
-    "dy": 9223,
-    "ks": 9224,
-    "xhs": 9225,
-    "tb": 9226,
-    "yy": 9227,
-}
+# v8.3.8: 单浏览器进程单例
+_SHARED_BROWSER_SESSION = None   # (p, browser, chrome_proc, port)
+
+
+# v8.3.7: 给每个平台分配固定 CDP 调试端口（v8.3.8 不再使用，保留兼容）
+# v8.3.8: 单 chrome.exe + 单端口 9222（所有平台共用）
+_CDP_PORT_SHARED = 9222
 
 
 # v8.3.7: 应用缓存目录统一管理（便携优先）
@@ -4235,13 +4235,13 @@ def _cleanup_all_playwright_contexts():
 
     v8.3.6: 强制 taskkill chrome.exe 释放 _MEIPASS 临时目录锁
     v8.3.7: 优先用 session 里的 chrome_proc 句柄优雅 terminate，taskkill 兜底
+    v8.3.8: 处理 _SHARED_BROWSER_SESSION 单例（共用 chrome.exe）
     """
     # 1. 优雅关闭 Playwright
     for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
             _, ctx_or_browser = entry
             if ctx_or_browser is not None:
-                # launch_persistent_context 的 context 或 CDP 的 browser
                 if hasattr(ctx_or_browser, 'close'):
                     ctx_or_browser.close()
                 elif hasattr(ctx_or_browser, 'contexts'):
@@ -4256,15 +4256,23 @@ def _cleanup_all_playwright_contexts():
             pass
     _PLATFORM_BROWSER_RUNNERS.clear()
 
-    # 2. v8.3.7: 优先用 session 里的 chrome_proc 句柄 terminate
-    for platform_key, sess in list(_PLATFORM_BROWSER_SESSIONS.items()):
+    # 2. v8.3.8: 优雅关闭共享 chrome.exe
+    if _SHARED_BROWSER_SESSION is not None:
         try:
-            _, _, chrome_proc = sess
+            _, _, chrome_proc, _ = _SHARED_BROWSER_SESSION
             if chrome_proc and chrome_proc.poll() is None:
                 chrome_proc.terminate()
         except Exception:
             pass
-    _PLATFORM_BROWSER_SESSIONS.clear()
+        # 兼容 v8.3.7 旧的多 session 残留
+        for platform_key, sess in list(_PLATFORM_BROWSER_SESSIONS.items()):
+            try:
+                _, _, chrome_proc = sess
+                if chrome_proc and chrome_proc.poll() is None:
+                    chrome_proc.terminate()
+            except Exception:
+                pass
+        _PLATFORM_BROWSER_SESSIONS.clear()
 
     # 3. 强制 taskkill 残留 chrome.exe（关键：释放 _MEIPASS 临时目录锁）
     import time as _time
@@ -4300,28 +4308,30 @@ _PLATFORM_BROWSER_MAP = {
 
 
 def _open_platform_in_chromium(platform_key: str, target_url: str,
-                              wait_timeout: float = 20.0) -> tuple:
+                              wait_timeout: float = 15.0) -> tuple:
     """用对应平台的嵌入式 Chromium 浏览器打开 URL（与解析时的浏览器共享 cookie）。
 
-    v8.3.7 重大修复：之前用 Playwright launch_persistent_context 在某些 Windows
-    环境（用户机器）启动 chrome.exe 但 GUI 窗口不弹出，状态栏显示"已打开"实际
-    没看到浏览器窗口。现在改用：
-      1. subprocess.Popen 直接启动 chrome.exe（窗口保证显示）
-      2. Playwright 通过 CDP 端口（9223-9227）连接控制
-      3. cookie 通过 --user-data-dir 参数持久化（与解析流 fetch_xxx 共享）
+    v8.3.8 重大改进：所有 5 个平台共用**同一个** chrome.exe 浏览器进程 + 单 CDP 端口
+    （9222）+ 单 user-data-dir。每个平台以**新 tab** 形式加入同一个浏览器窗口。
+    cookie 按 URL 域名自动隔离（不同平台不同域）。
+
+    v8.3.7 之前是每个平台独立 chrome.exe → 5 个窗口（用户反馈太多）
+    v8.3.5 之前是 Playwright launch_persistent_context → GUI 不显示
+    v8.3.4 之前是 daemon thread 提前退出 → 闪退
+    v8.3.1 之前是 with sync_playwright() 上下文 → 启动后立刻关闭
 
     Returns:
         (ok: bool, error_msg: str)
     """
+    global _SHARED_BROWSER_SESSION
+
     if platform_key not in _PLATFORM_BROWSER_MAP:
         return False, f"不支持的平台: {platform_key}"
 
-    # v8.3.5: 已有 session → 复用 + 在同一窗口新开 tab（不再启动新窗口、不 taskkill）
-    existing = _PLATFORM_BROWSER_SESSIONS.get(platform_key)
-    if existing is not None:
+    # v8.3.8: 已有共享浏览器 → 在同一窗口新开（不重启窗口、不 taskkill）
+    if _SHARED_BROWSER_SESSION is not None:
         try:
-            # v8.3.7: session 结构从 (p, context) 改为 (p, browser, chrome_proc)
-            _, browser, _ = existing
+            _, browser, _, port = _SHARED_BROWSER_SESSION
             context = browser.contexts[0]
             page = context.new_page()
             try:
@@ -4331,16 +4341,14 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                     page.goto(target_url, wait_until="commit", timeout=15000)
                 except Exception:
                     pass
-            print(f"[{platform_key}] 复用现有浏览器窗口，新开 tab")
+            print(f"[{platform_key}] 复用浏览器窗口，新开 tab")
             return True, ""
         except Exception as e:
-            print(f"[{platform_key}] session 失效 {e}，重新启动浏览器")
-            _PLATFORM_BROWSER_SESSIONS.pop(platform_key, None)
+            print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
+            _SHARED_BROWSER_SESSION = None
 
-    # v8.3.7: 用 subprocess.Popen 直接启动 chrome.exe（绕过 Playwright launch GUI 不显示问题）
-    port = _CDP_PORT_MAP.get(platform_key)
-    if not port:
-        return False, f"平台 {platform_key} 没有 CDP 端口分配"
+    # v8.3.8: 启动共享 chrome.exe（5 个平台共用）
+    port = _CDP_PORT_SHARED
 
     # chrome.exe 路径
     browser_path = _ensure_chromium_ready()
@@ -4350,9 +4358,8 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     if not os.path.isfile(chrome_exe):
         return False, f"chrome.exe 不存在: {chrome_exe}"
 
-    # data_dir
-    data_dir_func, _ = _PLATFORM_BROWSER_MAP[platform_key]
-    data_dir = data_dir_func()
+    # 共享 data_dir（所有平台 cookie 都存在这里，Chrome 按 URL 域名隔离）
+    data_dir = _get_app_cache_dir("shared_browser_data")
 
     # 检查端口是否被占用（残留 chrome.exe），被占用则 taskkill 释放
     import socket as _socket
@@ -4375,7 +4382,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     # 强制解锁 data_dir（防 SingletonLock 残留）
     _force_unlock_chromium_dir(data_dir)
 
-    # 启动 chrome.exe（独立进程组，atexit 统一清理）
+    # 启动 chrome.exe（单进程，5 个平台共用）
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4390,8 +4397,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     ]
     creation_flags = 0
     if sys.platform == 'win32':
-        # CREATE_NO_WINDOW (0x08000000) 不显示控制台窗口
-        creation_flags = 0x08000000
+        creation_flags = 0x08000000  # CREATE_NO_WINDOW
     try:
         chrome_proc = subprocess.Popen(
             cmd,
@@ -4442,7 +4448,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                     pass
 
             _PLATFORM_BROWSER_RUNNERS.append((p, browser))
-            _PLATFORM_BROWSER_SESSIONS[platform_key] = (p, browser, chrome_proc)
+            _SHARED_BROWSER_SESSION = (p, browser, chrome_proc, port)
             result["ok"] = True
             result["error"] = ""
             ready_event.set()
