@@ -4392,7 +4392,8 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     _force_unlock_chromium_dir(data_dir)
 
     # 启动 chrome.exe（单进程，5 个平台共用）
-    # v8.3.9: 不在 cmd 里加 target_url，避免初始页 tab + CDP new_page 重复双 tab
+    # v8.3.10: 不要 --no-startup-window（否则 chrome 不开窗口导致用户看不到）。
+    #           带 target_url 作为初始 tab，CDP 接管后**复用初始 tab**（避免双 tab）。
     cmd = [
         chrome_exe,
         f"--user-data-dir={data_dir}",
@@ -4403,7 +4404,7 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=Translate",
-        "--no-startup-window",  # 不自动打开 initial tab
+        target_url,
     ]
     creation_flags = 0
     if sys.platform == 'win32':
@@ -4448,10 +4449,18 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                 return
 
             context = browser.contexts[0]
-            # v8.3.9: 不要 new_page()，因为 chrome.exe 已启动无 initial tab，
-            # 直接 goto 第一个 page（其实没有页面所以这一步会失败）；
-            # 让 main_window._open_platform_in_chromium 在第一次点击时建 tab
-            # → 改为：主线程 return True 后立即由外部异步 new_page + goto
+            # v8.3.10: 不要 new_page（chrome 启动时已开初始 tab 显示 target_url）。
+            #           复用初始 tab，避免双 tab。
+            pages = context.pages
+            if pages:
+                # 异步等初始 tab 加载完成（不阻塞主线程）
+                def _wait_initial():
+                    try:
+                        pages[0].wait_for_load_state("domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                _threading.Thread(target=_wait_initial, daemon=True).start()
+
             _PLATFORM_BROWSER_RUNNERS.append((p, browser))
             _SHARED_BROWSER_SESSION = (p, browser, chrome_proc, port)
             result["ok"] = True
