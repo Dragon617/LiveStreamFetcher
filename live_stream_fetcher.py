@@ -4123,10 +4123,29 @@ def _save_visit_count(n: int) -> None:
         pass
 
 
+# v8.4.7: widgets.link 访客计数器（启动时静默访问一次，服务端会 +1 计数）
+_WIDGET_VISITOR_URL = (
+    "https://www.widgets.link/#/view/visitor-01"
+    "?id=5144d796-d7bb-46f9-80cc-e2ba469d6013"
+)
+
+
 def bump_visit_count_on_startup() -> int:
-    """启动时调用：累加 1 并返回最新值。"""
+    """启动时调用：本地计数 +1，并静默触发 widgets.link 访客统计。"""
     n = _load_visit_count() + 1
     _save_visit_count(n)
+
+    # 静默 ping widgets.link 访客统计（网络错误不影响启动）
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            _WIDGET_VISITOR_URL,
+            headers={"User-Agent": "LiveStreamFetcher/8.4.7"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # 网络错误/超时/SSL 等都不影响本地启动
+
     return n
 
 
@@ -4328,23 +4347,36 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         return False, f"不支持的平台: {platform_key}"
 
     # v8.4.4: 复用 session：用 BrowserContext.new_page() 创建新 tab + goto
+    # v8.4.7: goto 失败时清掉 _SHARED_BROWSER_SESSION（让下次重启 chrome），
+    #   避免复用已损坏的 context 导致"Target page, context or browser has been closed"。
     if _SHARED_BROWSER_SESSION is not None:
         try:
             _, context, _, _ = _SHARED_BROWSER_SESSION
-            page = context.new_page()
-            page.set_default_navigation_timeout(20000)
+            # 先探测 context 健康（防止 chrome 进程已死但 session 还指向它）
             try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-            except Exception as e1:
+                _ = context.pages
+            except Exception as probe_err:
+                print(f"[{platform_key}] context 探测失败 {probe_err}，重启浏览器")
+                _SHARED_BROWSER_SESSION = None
+                # fall through 启动新 chrome
+
+            if _SHARED_BROWSER_SESSION is not None:
+                page = context.new_page()
+                page.set_default_navigation_timeout(20000)
                 try:
-                    page.goto(target_url, wait_until="commit", timeout=15000)
-                except Exception as e2:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e1:
                     try:
-                        page.close()
-                    except Exception:
-                        pass
-                    return False, f"goto 失败: domcontentloaded={e1}, commit={e2}"
-            return True, ""
+                        page.goto(target_url, wait_until="commit", timeout=15000)
+                    except Exception as e2:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        # v8.4.7: 清掉坏 session，下次重启 chrome
+                        _SHARED_BROWSER_SESSION = None
+                        return False, f"goto 失败: domcontentloaded={e1}, commit={e2}"
+                return True, ""
         except Exception as e:
             print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
             _SHARED_BROWSER_SESSION = None
