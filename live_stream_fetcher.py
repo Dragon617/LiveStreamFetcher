@@ -4184,12 +4184,63 @@ _PLATFORM_BROWSER_RUNNERS = []
 _PLATFORM_BROWSER_SESSIONS = {}   # 保留占位但不再使用（兼容旧调用）
 
 # v8.3.8: 单浏览器进程单例
-_SHARED_BROWSER_SESSION = None   # (p, browser, chrome_proc, port)
+_SHARED_BROWSER_SESSION = None   # (p, context, None, 0)
 
 
 # v8.3.7: 给每个平台分配固定 CDP 调试端口（v8.3.8 不再使用，保留兼容）
 # v8.3.8: 单 chrome.exe + 单端口 9222（所有平台共用）
 _CDP_PORT_SHARED = 9222
+
+
+def _close_shared_browser_for_fetch(reason: str = "parse"):
+    """v8.4.11: 解析流前关闭共享内置浏览器。
+
+    业务层 fetch_xxx 会启动**新** chrome.exe 抓流，但 Chrome 同 user_data_dir
+    同时只允许一个进程持有 SingletonLock——若内置浏览器还在跑，新 chrome 启动
+    时会被 Chrome 自动 fallback 到临时空 Profile，丢失已登录的 cookie。
+
+    解决方案：解析前主动关闭内置浏览器（释放 SingletonLock），让 fetch_xxx
+    启动新 chrome 时能从 shared_browser_data 读到 cookie（已登录态）。
+
+    Args:
+        reason: "parse"（解析）/ "fetch"（业务流）—— 用于日志
+    """
+    global _SHARED_BROWSER_SESSION
+    if _SHARED_BROWSER_SESSION is None:
+        return False
+    try:
+        _, context, _, _ = _SHARED_BROWSER_SESSION
+        # 优雅关闭所有 page
+        try:
+            for p in list(context.pages):
+                try:
+                    if not p.is_closed():
+                        p.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 关闭 context（会触发 driver 关闭 chrome.exe）
+        try:
+            context.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 停止 Playwright driver
+    try:
+        # 注意：(p, context, ...) 结构
+        if _SHARED_BROWSER_SESSION is not None:
+            p = _SHARED_BROWSER_SESSION[0]
+            if p is not None:
+                p.stop()
+    except Exception:
+        pass
+    _SHARED_BROWSER_SESSION = None
+    # 等待 chrome.exe 完全退出（释放 SingletonLock 文件锁）
+    import time as _time
+    _time.sleep(1.5)
+    return True
 
 
 # v8.3.7: 应用缓存目录统一管理（便携优先）
@@ -4455,6 +4506,8 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     #   - context.new_page() 后必须 wait_for_load_state 等初始 about:blank 加载完成
     #     （Playwright 内部要 200-500ms 注册新 page，否则立即 goto 会报"page closed"）
     #   - goto 失败**不再**清 _SHARED_BROWSER_SESSION，只在 context 探测失败时清
+    # v8.4.11: 复用前清理所有 about:blank 残留 page（v8.4.10 失败时累积了 4 个 about:blank，
+    #   因为 page.close() 在 chrome 端已失效的 page 上抛异常被吞掉）
     if _SHARED_BROWSER_SESSION is not None:
         try:
             _, context, _, _ = _SHARED_BROWSER_SESSION
@@ -4467,6 +4520,23 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                 # fall through 启动新 chrome
 
             if _SHARED_BROWSER_SESSION is not None:
+                # v8.4.11: 清理上次失败留下的 about:blank 残留 page
+                # goto 失败时 page 可能在 Playwright 端已 close 但 Chrome 端 tab 还在
+                # 用 context.pages 列出所有 page，检查 URL 关闭 about:blank
+                try:
+                    for old_page in list(context.pages):
+                        try:
+                            url = old_page.url if not old_page.is_closed() else ""
+                            if url and url in ("about:blank", "chrome://newtab/", "chrome://newtab"):
+                                try:
+                                    old_page.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 page = context.new_page()
                 page.set_default_navigation_timeout(20000)
                 # v8.4.8: 关键——等初始 about:blank 加载完成，给 Playwright 时间
@@ -4655,8 +4725,22 @@ def parse_stream_info(info: dict) -> list:
 def extract_streams(url: str, proxy: str = "") -> dict:
     """
     主提取函数：优先使用平台专属解析器，失败后降级到 yt-dlp
+
+    v8.4.11: 解析前自动关闭共享内置浏览器。
+    Chrome 同 user_data_dir 同时只允许一个进程持有 SingletonLock——
+    若内置浏览器还在跑，业务层 fetch_xxx 启动的新 chrome 会被 Chrome fallback
+    到临时空 Profile，丢失已登录的 cookie。所以解析前主动关闭内置浏览器，
+    释放 SingletonLock，让 fetch_xxx 启动新 chrome 时能读到 cookie（已登录态）。
     """
     platform = detect_platform(url)
+
+    # v8.4.11: 解析前关闭共享内置浏览器（解决"已登录但解析还要登录"的问题）
+    if _SHARED_BROWSER_SESSION is not None:
+        try:
+            print(f"[{platform}] 解析前关闭共享内置浏览器（释放 SingletonLock）...")
+            _close_shared_browser_for_fetch(reason=f"parse-{platform}")
+        except Exception as e:
+            print(f"[{platform}] 关闭共享浏览器失败: {e}")
 
     # 1. 尝试平台专属解析器
     if platform in PLATFORM_FETCHERS:
