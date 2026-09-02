@@ -543,7 +543,7 @@ class MainWindow(QMainWindow):
         """v8.5.0: 打开设置对话框（浏览器引擎等）。"""
         dlg = SettingsDialog(parent=self)
         if dlg.exec():
-            self.platform_info_label.setText("设置已保存，下次打开浏览器时生效")
+            self.platform_info_label.setText("设置已保存，立即生效")
 
     def _on_proxy_clicked(self):
         self.platform_info_label.setText("解析淘宝/小红书流后自动启动本地代理")

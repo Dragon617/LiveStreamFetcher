@@ -125,7 +125,7 @@ PLATFORM_META = {
     "ks": {
         "name": "快手直播", "short": "快手", "icon": "📹",
         "icon_path": "icons/ks_real.png",
-        "open_url": "https://passport.kuaishou.com/pc/account/login",
+        "open_url": "https://www.kuaishou.com/",
         "color": Colors.PLATFORM_KUAISHOU,
         "desc": "支持 kuaishou.com 域名解析 · 需扫码登录",
         "login": True,
@@ -141,7 +141,7 @@ PLATFORM_META = {
     "yy": {
         "name": "YY 直播", "short": "YY", "icon": "🎤",
         "icon_path": "icons/yy_real.png",
-        "open_url": "https://www.yy.com/",
+        "open_url": "https://www.yy.com/i/index/anchor",
         "color": Colors.PLATFORM_YY,
         "desc": "支持 www.yy.com / wap.yy.com 多端解析",
         "login": False,

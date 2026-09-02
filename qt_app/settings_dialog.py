@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""settings_dialog.py — 软件设置对话框（v8.5.0）
+"""settings_dialog.py — 软件设置对话框（v8.5.1）
 
 当前设置项：
   - 浏览器引擎：本软件内置浏览器（Chrome for Testing，推荐）
@@ -7,15 +7,102 @@
 
 配置通过业务层 `_get_browser_engine()` / `_set_browser_engine()` 持久化到
 缓存根目录 settings.json，平台登录浏览器与解析浏览器共用同一引擎。
+
+v8.5.1：
+  - 选项改为卡片式大按钮（金色边框 + ✓ 角标高亮选中态），
+    解决"选中没选中看不出来"的问题
+  - 保存后立即关闭当前共享浏览器，引擎切换即时生效，
+    解决"保存后软件跳转的还是内置浏览器"的问题
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QRadioButton, QButtonGroup, QFrame,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
 )
 
 from .theme import Colors
+
+
+class _EngineCard(QFrame):
+    """可勾选的引擎选项卡片（金色边框 + ✓ 角标表示选中）。"""
+
+    clicked = Signal()
+
+    def __init__(self, title: str, hint: str, parent=None):
+        super().__init__(parent)
+        self._checked = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(72)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(10)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(4)
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setStyleSheet("background: transparent; border: none;")
+        text_col.addWidget(self._title_lbl)
+        self._hint_lbl = QLabel(hint)
+        self._hint_lbl.setWordWrap(True)
+        self._hint_lbl.setStyleSheet(
+            f"font-size: 10px; color: {Colors.TEXT_MUTED};"
+            "background: transparent; border: none;"
+        )
+        text_col.addWidget(self._hint_lbl)
+        lay.addLayout(text_col, 1)
+
+        self._check_lbl = QLabel("✓")
+        self._check_lbl.setFixedWidth(22)
+        self._check_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._check_lbl.setStyleSheet("background: transparent; border: none;")
+        lay.addWidget(self._check_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._refresh_style()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, on: bool):
+        if self._checked == on:
+            return
+        self._checked = on
+        self._refresh_style()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(ev)
+
+    def _refresh_style(self):
+        if self._checked:
+            self.setStyleSheet(
+                f"_EngineCard {{ background: {Colors.BG_CARD_LIGHT};"
+                f"border: 2px solid {Colors.GOLD_PRIMARY}; border-radius: 10px; }}"
+            )
+            self._title_lbl.setStyleSheet(
+                f"font-size: 13px; font-weight: bold; color: {Colors.GOLD_PRIMARY};"
+                "background: transparent; border: none;"
+            )
+            self._check_lbl.setStyleSheet(
+                f"font-size: 16px; font-weight: bold; color: {Colors.GOLD_PRIMARY};"
+                "background: transparent; border: none;"
+            )
+        else:
+            self.setStyleSheet(
+                f"_EngineCard {{ background: {Colors.BG_CARD};"
+                f"border: 2px solid {Colors.BORDER}; border-radius: 10px; }}"
+                f"_EngineCard:hover {{ border-color: {Colors.BORDER_LIGHT};"
+                f"background: {Colors.BG_CARD_HOVER}; }}"
+            )
+            self._title_lbl.setStyleSheet(
+                f"font-size: 13px; font-weight: bold; color: {Colors.TEXT_PRIMARY};"
+                "background: transparent; border: none;"
+            )
+            self._check_lbl.setStyleSheet(
+                "font-size: 16px; font-weight: bold; color: transparent;"
+                "background: transparent; border: none;"
+            )
 
 
 class SettingsDialog(QDialog):
@@ -24,7 +111,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setFixedSize(480, 300)
+        self.setFixedSize(500, 380)
         self.setModal(True)
 
         self._build_ui()
@@ -45,55 +132,34 @@ class SettingsDialog(QDialog):
         )
         lay.addWidget(title)
 
-        sub = QLabel("选择平台登录浏览器与解析直播流时使用的浏览器：")
+        sub = QLabel("选择平台登录浏览器与解析直播流时使用的浏览器（点击卡片选择）：")
         sub.setWordWrap(True)
         sub.setStyleSheet(
             f"font-size: 11px; color: {Colors.TEXT_MUTED}; background: transparent;"
         )
         lay.addWidget(sub)
 
-        # 选项卡片
-        card = QFrame()
-        card.setStyleSheet(
-            f"QFrame {{ background: {Colors.BG_CARD}; border: 1px solid {Colors.BORDER};"
-            f"border-radius: 10px; }}"
+        # 引擎选项卡片
+        self._card_builtin = _EngineCard(
+            "本软件内置浏览器（推荐）",
+            "无需安装任何浏览器，开箱即用，内置完整视频编解码",
         )
-        card_lay = QVBoxLayout(card)
-        card_lay.setContentsMargins(18, 14, 18, 14)
-        card_lay.setSpacing(10)
-
-        self._radio_builtin = QRadioButton("本软件内置浏览器（推荐）")
-        self._radio_builtin.setStyleSheet(self._radio_style())
-        self._radio_system = QRadioButton("电脑自带浏览器（系统 Chrome / Edge）")
-        self._radio_system.setStyleSheet(self._radio_style())
-
-        self._btn_group = QButtonGroup(self)
-        self._btn_group.addButton(self._radio_builtin, 0)
-        self._btn_group.addButton(self._radio_system, 1)
-
-        card_lay.addWidget(self._radio_builtin)
-        hint1 = QLabel("无需安装任何浏览器，开箱即用，内置完整视频编解码")
-        hint1.setStyleSheet(
-            f"font-size: 10px; color: {Colors.TEXT_MUTED}; background: transparent;"
-            "padding-left: 24px;"
+        self._card_system = _EngineCard(
+            "电脑自带浏览器（系统 Chrome / Edge）",
+            "调用电脑已安装的 Chrome / Edge 执行登录与解析等全部步骤",
         )
-        card_lay.addWidget(hint1)
-
-        card_lay.addWidget(self._radio_system)
-        hint2 = QLabel("调用电脑已安装的 Chrome / Edge 执行登录与解析等全部步骤")
-        hint2.setStyleSheet(
-            f"font-size: 10px; color: {Colors.TEXT_MUTED}; background: transparent;"
-            "padding-left: 24px;"
-        )
-        card_lay.addWidget(hint2)
-
-        lay.addWidget(card)
+        self._card_builtin.clicked.connect(lambda: self._select("builtin"))
+        self._card_system.clicked.connect(lambda: self._select("system"))
+        lay.addWidget(self._card_builtin)
+        lay.addWidget(self._card_system)
 
         # 状态提示
-        self.hint_label = QLabel("")
+        self.hint_label = QLabel(
+            "注意：切换引擎后需要重新登录各平台（不同浏览器的登录数据不互通）"
+        )
         self.hint_label.setWordWrap(True)
         self.hint_label.setStyleSheet(
-            f"font-size: 11px; color: {Colors.ACCENT_BLUE}; background: transparent;"
+            f"font-size: 11px; color: {Colors.ACCENT_ORANGE}; background: transparent;"
         )
         lay.addWidget(self.hint_label)
 
@@ -120,21 +186,6 @@ class SettingsDialog(QDialog):
         lay.addLayout(btn_row)
 
     @staticmethod
-    def _radio_style() -> str:
-        return f"""
-            QRadioButton {{
-                color: {Colors.TEXT_PRIMARY};
-                font-size: 13px;
-                font-weight: bold;
-                background: transparent;
-                spacing: 8px;
-            }}
-            QRadioButton::indicator {{
-                width: 16px; height: 16px;
-            }}
-        """
-
-    @staticmethod
     def _btn_style(bg: str, fg: str) -> str:
         return f"""
             QPushButton {{
@@ -145,29 +196,42 @@ class SettingsDialog(QDialog):
             QPushButton:hover {{ opacity: 0.85; }}
         """
 
+    def _select(self, engine: str):
+        self._card_builtin.setChecked(engine == "builtin")
+        self._card_system.setChecked(engine == "system")
+
+    def _selected_engine(self) -> str:
+        return "system" if self._card_system.isChecked() else "builtin"
+
     def _load_current(self):
-        """读取当前引擎设置并选中对应单选项。"""
+        """读取当前引擎设置并选中对应卡片。"""
         engine = "builtin"
         try:
             from live_stream_fetcher import _get_browser_engine
             engine = _get_browser_engine()
         except Exception:
             pass
-        if engine == "system":
-            self._radio_system.setChecked(True)
-        else:
-            self._radio_builtin.setChecked(True)
+        self._select("system" if engine == "system" else "builtin")
 
     def _on_save(self):
-        engine = "system" if self._radio_system.isChecked() else "builtin"
+        engine = self._selected_engine()
+        old_engine = "builtin"
         try:
-            from live_stream_fetcher import _set_browser_engine
+            from live_stream_fetcher import _get_browser_engine, _set_browser_engine
+            old_engine = _get_browser_engine()
             ok = _set_browser_engine(engine)
         except Exception as e:
             self.hint_label.setText(f"保存失败：{e}")
             return
         if ok:
-            self.hint_label.setText("已保存，下次打开浏览器时生效")
+            # v8.5.1: 引擎变化时立即关闭当前共享浏览器，让下次打开
+            # 直接用新引擎启动（保存即生效）。
+            if engine != old_engine:
+                try:
+                    from live_stream_fetcher import _close_shared_browser_for_fetch
+                    _close_shared_browser_for_fetch("engine-switch")
+                except Exception:
+                    pass
             self.accept()
         else:
             self.hint_label.setText("保存失败：无法写入配置文件")

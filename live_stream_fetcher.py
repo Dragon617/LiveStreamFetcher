@@ -610,6 +610,7 @@ def _force_unlock_chromium_dir(user_data_dir):
 
     abs_dir = os.path.abspath(user_data_dir)
     ps_path = abs_dir.replace("\\", "\\\\")
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
     try:
         ps_script = (
@@ -621,21 +622,33 @@ def _force_unlock_chromium_dir(user_data_dir):
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
         )
-        killed = 0
+        pids = []
         for line in (result.stdout or "").splitlines():
             line = line.strip()
             if line.isdigit():
+                pids.append(line)
+        # v8.5.1: 先礼后兵——第一轮不带 /F（WM_CLOSE 优雅退出，让 chrome
+        # flush Cookies SQLite 到磁盘，硬杀会丢登录），第二轮才 /F 兜底。
+        if pids:
+            print("[ChromiumUnlock] 请求关闭 {} 个占用 {} 的 chrome.exe".format(len(pids), os.path.basename(user_data_dir)))
+            for line in pids:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", line],
+                        capture_output=True, timeout=5, creationflags=NO_WINDOW,
+                    )
+                except Exception:
+                    pass
+            time.sleep(2.5)
+            for line in pids:
                 try:
                     subprocess.run(
                         ["taskkill", "/F", "/PID", line],
-                        capture_output=True, timeout=5,
+                        capture_output=True, timeout=5, creationflags=NO_WINDOW,
                     )
-                    killed += 1
                 except Exception:
                     pass
-        if killed:
-            print("[ChromiumUnlock] 关闭了 {} 个占用 {} 的 chrome.exe".format(killed, os.path.basename(user_data_dir)))
-            time.sleep(1.5)
+            time.sleep(1.0)
     except Exception:
         pass
 
@@ -4296,19 +4309,35 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
     """
     p = None
     context = None
+    _cur_exe = None   # 当前 context 使用的 chrome 可执行文件路径
+    _cur_dir = None   # 当前 context 使用的 user_data_dir
+
+    def _norm_path(s):
+        return os.path.normcase(os.path.normpath(str(s or "")))
 
     def _teardown():
-        nonlocal p, context
+        nonlocal p, context, _cur_exe, _cur_dir
+        data_dir = _cur_dir
         try:
             if context is not None:
                 context.close()
-                # v8.4.13: context.close() 返回时 chrome 进程可能仍在异步
-                # flush Cookies SQLite 到磁盘，紧接 p.stop() 硬杀 driver 会
-                # 打断 flush → 用户"总是掉登录"。给 chrome 退出留时间。
-                import time as _t
-                _t.sleep(1.0)
         except Exception:
             pass
+        # v8.5.1: context.close() 返回时 chrome 进程可能仍在异步 flush
+        # Cookies SQLite 到磁盘。v8.4.13 固定 sleep(1.0) 在慢机器上不够，
+        # 紧接 p.stop() 硬杀 driver / 后续 aggressive kill 会打断 flush
+        # → 用户"总是掉登录"。改为轮询等 chrome 进程真正退出（最多 5s）。
+        if data_dir:
+            try:
+                import time as _t
+                _pk = os.path.basename(str(data_dir).rstrip("\\/"))
+                _deadline = _t.time() + 5.0
+                while _t.time() < _deadline:
+                    if _count_chrome_by_profile(_pk) == 0:
+                        break
+                    _t.sleep(0.3)
+            except Exception:
+                pass
         try:
             if p is not None:
                 p.stop()
@@ -4316,10 +4345,12 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
             pass
         p = None
         context = None
+        _cur_exe = None
+        _cur_dir = None
 
     def _launch_fresh(target_url, data_dir, chrome_exe_path):
         """全新启动浏览器并导航（在 worker 线程内调用）。"""
-        nonlocal p, context
+        nonlocal p, context, _cur_exe, _cur_dir
         from playwright.sync_api import sync_playwright
         p = sync_playwright().start()
         context = p.chromium.launch_persistent_context(
@@ -4331,10 +4362,15 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-blink-features=AutomationControlled",
+                # v8.5.1: 禁用 Chrome 侧边栏搜索面板——点击页面内容时可能
+                # 误触侧边搜索面板弹出（看起来像"DevTools 自动打开"）
+                "--disable-features=SideSearch",
             ],
             ignore_default_args=["--no-sandbox"],
             timeout=30000,
         )
+        _cur_exe = chrome_exe_path
+        _cur_dir = data_dir
         # 首次启动：复用初始 New Tab Page，避免双 tab
         pages = context.pages
         if pages:
@@ -4362,6 +4398,16 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
         try:
             if cmd == "open":
                 target_url, data_dir, chrome_exe_path = payload
+                # v8.5.1: 浏览器引擎/数据目录变化检测——用户在设置里切换
+                # 「内置浏览器 ↔ 电脑自带浏览器」后，存活 context 仍是旧引擎
+                # 启动的，new_page 探测会成功从而错误复用旧引擎（设置不生效）。
+                # exe/dir 不一致时先 teardown 再用新引擎重启。
+                if context is not None and (
+                    _norm_path(chrome_exe_path) != _norm_path(_cur_exe)
+                    or _norm_path(data_dir) != _norm_path(_cur_dir)
+                ):
+                    print("[shared-pw] 浏览器引擎已切换，重启浏览器")
+                    _teardown()
                 # v8.4.13: 健康探测改为**直接试 new_page**（探测与创建合一）。
                 # v8.4.12 用 `_ = context.pages` 探测——用户手动关闭浏览器窗口后，
                 # context.pages 返回的是 Playwright 端缓存的列表，不抛异常，
@@ -4474,6 +4520,70 @@ def _count_chrome_by_profile(profile_key: str) -> int:
         return -1
 
 
+def _graceful_kill_profile_chrome(profile_key: str, grace_sec: float = 4.0) -> int:
+    """v8.5.1: 先礼后兵关闭使用指定 profile 的 chrome/msedge 进程。
+
+    旧路径（taskkill /F、Stop-Process -Force）直接硬杀，chrome 来不及把
+    Cookies SQLite / localStorage flush 到磁盘 → 用户"总是掉登录"。
+    新流程：
+      1. 找出 CommandLine 含 profile_key 的**主进程**（不含 --type= 参数）
+      2. taskkill /PID（不带 /F）→ 向窗口发 WM_CLOSE，chrome 优雅退出并 flush
+      3. 轮询等进程全部退出（最多 grace_sec 秒）
+      4. 仍存活的才 taskkill /F /T 硬杀兜底
+
+    Returns:
+        0 = 全部退出；>0 = 仍有残留（已硬杀）
+    """
+    import time as _time
+    if sys.platform != "win32":
+        return 0
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    def _list_main_pids() -> list:
+        try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and "
+                f"$_.CommandLine -like '*{profile_key}*' -and "
+                "$_.CommandLine -notlike '*--type=*' } | "
+                "ForEach-Object { $_.ProcessId }"
+            )
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, creationflags=NO_WINDOW,
+            )
+            return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().isdigit()]
+        except Exception:
+            return []
+
+    # 1. 优雅关闭主进程（WM_CLOSE，chrome 会自行 flush cookie 并退出子进程）
+    main_pids = _list_main_pids()
+    for pid in main_pids:
+        try:
+            subprocess.run(["taskkill", "/PID", pid], capture_output=True, timeout=5,
+                           creationflags=NO_WINDOW)
+        except Exception:
+            pass
+    if not main_pids:
+        return 0
+    # 2. 轮询等进程全部退出（cookie flush 完成）
+    deadline = _time.time() + max(0.5, grace_sec)
+    while _time.time() < deadline:
+        if _count_chrome_by_profile(profile_key) == 0:
+            return 0
+        _time.sleep(0.4)
+    # 3. 兜底硬杀（含子进程树）
+    for pid in _list_main_pids():
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", pid], capture_output=True, timeout=5,
+                           creationflags=NO_WINDOW)
+        except Exception:
+            pass
+    _time.sleep(0.8)
+    return _count_chrome_by_profile(profile_key)
+
+
 def _wait_singleton_lock_released(data_dir: str, timeout: float = 8.0) -> bool:
     """轮询等待使用 data_dir 的 chrome 进程完全退出（cookie flush 到磁盘）。
 
@@ -4538,19 +4648,11 @@ def _close_shared_browser_for_fetch(reason: str = "parse"):
     data_dir = _get_app_cache_dir("shared_browser_data")
     released = _wait_singleton_lock_released(data_dir, timeout=6.0)
     if not released:
-        # 3. 兜底：精确杀使用 shared_browser_data profile 的 chrome 进程
+        # 3. v8.5.1: 先礼后兵——先发 WM_CLOSE 让 chrome 优雅退出并 flush
+        #    Cookies（硬杀会打断 flush → "总是掉登录"），等不到才 /F 兜底。
         #    （按 CommandLine 过滤，不误伤用户自己的 Chrome 浏览器）
         try:
-            ps_cmd = (
-                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-                "Where-Object { $_.CommandLine -like '*shared_browser_data*' } | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-            )
-            NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                capture_output=True, timeout=15, creationflags=NO_WINDOW,
-            )
+            _graceful_kill_profile_chrome("shared_browser_data", grace_sec=3.0)
             _wait_singleton_lock_released(data_dir, timeout=3.0)
         except Exception:
             pass
@@ -4810,6 +4912,14 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
 
     # v8.4.9 关键：先杀 playwright driver（node.exe），再杀 chrome.exe
     _kill_playwright_node()
+
+    # v8.5.1: 先礼后兵——先 WM_CLOSE 优雅关闭本软件的 chrome（让其 flush
+    # Cookies SQLite 到磁盘，退出时硬杀会打断 flush → 丢登录），
+    # 存活者再进下方循环硬杀兜底。
+    try:
+        _graceful_kill_profile_chrome("shared_browser_data", grace_sec=4.0)
+    except Exception:
+        pass
 
     for round_idx in range(max_rounds):
         # 1. 强制杀本软件的 chrome/msedge + node.exe（v8.5.0: 不误伤用户浏览器）
