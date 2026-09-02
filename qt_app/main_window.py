@@ -555,7 +555,11 @@ class MainWindow(QMainWindow):
                 return
 
             # v8.3.2: 先安装证书（视频号工具抓 HTTPS 视频必需）
-            cert_dir = os.path.dirname(exe_path)
+            # v8.4.13: 证书在工具目录的"缓存"子目录中（保持原目录结构）
+            _exe_dir = os.path.dirname(exe_path)
+            cert_dir = os.path.join(_exe_dir, "缓存")
+            if not os.path.isdir(cert_dir):
+                cert_dir = _exe_dir  # 兼容旧版平铺结构
             self.platform_info_label.setText("正在安装视频号工具证书...")
             from PySide6.QtWidgets import QApplication
             QApplication.processEvents()

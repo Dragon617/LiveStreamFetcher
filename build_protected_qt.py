@@ -61,10 +61,15 @@ datas = [
     (r'{project_dir}\icons\logo_main.png', 'icons'),
     # v8.3.7: 完整 app_icon.ico（EXE 资源图标 + 任务栏图标，多尺寸 256/128/64/48/32/16）
     (r'{project_dir}\app_icon.ico', '.'),
-    (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
+    # v8.4.13: 换用 Chrome for Testing 143（Google 官方二进制，带 H.264/AAC/HEVC
+    # 专有编解码器 + 现代渲染引擎）。Chromium 无编解码导致直播页面视频区无法加载、
+    # 老版本渲染引擎导致 YY 等 SPA 页面 about:blank/卡住/乱码。
+    # 目标目录名保持 embedded_chromium 不变（业务代码零改动）。
+    (r'{project_dir}\vendor\chrome-win64', 'embedded_chromium'),
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     (r'{project_dir}\wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),
-    (r'{project_dir}\wechatVideoDownload2.8\缓存', 'wechat_video_tool'),
+    # v8.4.13: 保持工具目录结构——"缓存"必须是子目录（证书在其中），不能平铺
+    (r'{project_dir}\wechatVideoDownload2.8\缓存', r'wechat_video_tool\缓存'),
 ]
 hiddenimports = [
     '_threading_local',

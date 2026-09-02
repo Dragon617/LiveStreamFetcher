@@ -71,3 +71,6 @@ wechatVideoDownload2.8/
 .idea/
 *.swp
 *.swo
+
+# v8.4.13: Chrome for Testing 二进制（500MB，打包源，不入库）
+vendor/

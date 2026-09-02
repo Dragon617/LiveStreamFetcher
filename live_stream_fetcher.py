@@ -485,6 +485,12 @@ def _get_embedded_chromium_path():
     if os.path.isfile(portable_path):
         return os.path.dirname(portable_path)
 
+    # v8.4.13: 开发环境直接用 vendor\chrome-win64（Chrome for Testing 143）
+    if not getattr(sys, 'frozen', False):
+        vendor_path = os.path.join(exe_dir, "vendor", "chrome-win64", "chrome.exe")
+        if os.path.isfile(vendor_path):
+            return os.path.dirname(vendor_path)
+
     # 路径2: PyInstaller 临时目录（首次运行，datas 从 _MEIPASS 解压）
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         meipass_path = os.path.join(sys._MEIPASS, "embedded_chromium", "chrome.exe")
@@ -492,18 +498,34 @@ def _get_embedded_chromium_path():
             return os.path.dirname(meipass_path)
 
     # 路径3: 已释放到缓存目录（v8.3.7：EXE 同目录优先）
-    cached_path = os.path.join(_get_app_cache_dir("embedded_chromium"), "chrome.exe")
+    # v8.4.13: 校验版本标记——旧版 chromium-1208 无标记，返回 None 触发重新释放
+    cached_dir = _get_app_cache_dir("embedded_chromium")
+    cached_path = os.path.join(cached_dir, "chrome.exe")
     if os.path.isfile(cached_path):
-        return os.path.dirname(cached_path)
+        version_file = os.path.join(cached_dir, "_browser_version.txt")
+        try:
+            with open(version_file, "r", encoding="utf-8") as f:
+                if f.read().strip() == _EMBEDDED_BROWSER_VERSION:
+                    return os.path.dirname(cached_path)
+        except Exception:
+            pass  # 无版本文件/读取失败 → 视为旧版，走重新释放
+        return None
 
     return None
 
 
-def _extract_embedded_chromium():
-    """从 PyInstaller _MEIPASS 释放 Chromium 到缓存目录（v8.3.7：EXE 同目录优先）
+# v8.4.13: 内嵌浏览器版本标记——Chrome for Testing 143（带 H.264/AAC/HEVC 编解码）
+# 老用户机器上已释放的旧 chromium-1208 无版本标记 → 强制重新释放升级
+_EMBEDDED_BROWSER_VERSION = "cft-143.0.7499.192"
 
-    仅在首次运行时执行（检测目标目录无 chrome.exe 则释放）。
-    返回释放后的 chromium 目录路径，失败返回 None。
+
+def _extract_embedded_chromium():
+    """从 PyInstaller _MEIPASS 释放浏览器到缓存目录（v8.3.7：EXE 同目录优先）
+
+    v8.4.13: 增加版本标记校验——已释放目录若无版本文件或版本不匹配
+    （如旧版 chromium-1208），先清空再重新释放 Chrome for Testing 143。
+
+    返回释放后的浏览器目录路径，失败返回 None。
     """
     if not getattr(sys, 'frozen', False) or not hasattr(sys, '_MEIPASS'):
         return None
@@ -513,18 +535,36 @@ def _extract_embedded_chromium():
         return None
 
     dst_dir = _get_app_cache_dir("embedded_chromium")
+    version_file = os.path.join(dst_dir, "_browser_version.txt")
 
-    # 已存在则不重复释放
-    if os.path.isfile(os.path.join(dst_dir, "chrome.exe")):
-        return dst_dir
+    # 已存在且版本匹配则不重复释放
+    if os.path.isfile(os.path.join(dst_dir, "chrome.exe")) and os.path.isfile(version_file):
+        try:
+            with open(version_file, "r", encoding="utf-8") as f:
+                if f.read().strip() == _EMBEDDED_BROWSER_VERSION:
+                    return dst_dir
+        except Exception:
+            pass
+        # 版本不匹配 → 清空旧目录重新释放
+        print("[浏览器] 检测到旧版本内嵌浏览器，正在升级到 Chrome for Testing 143...")
+        try:
+            shutil.rmtree(dst_dir, ignore_errors=True)
+        except Exception:
+            pass
 
-    print(f"[Chromium] 首次运行，正在释放嵌入式浏览器到本地（约 400MB）→ {dst_dir}")
+    print(f"[浏览器] 首次运行/升级，正在释放嵌入式浏览器到本地（约 500MB）→ {dst_dir}")
     try:
         shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
-        print(f"[Chromium] 释放完成: {dst_dir}")
+        # 写入版本标记
+        try:
+            with open(version_file, "w", encoding="utf-8") as f:
+                f.write(_EMBEDDED_BROWSER_VERSION)
+        except Exception:
+            pass
+        print(f"[浏览器] 释放完成: {dst_dir}")
         return dst_dir
     except Exception as e:
-        print(f"[Chromium] 释放失败: {e}")
+        print(f"[浏览器] 释放失败: {e}")
         return None
 
 
@@ -716,7 +756,7 @@ def _ks_fetch_via_playwright(url, room_id):
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -1587,7 +1627,7 @@ def _dy_fetch_via_playwright(url: str) -> dict:
                 "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
+                    "Chrome/143.0.0.0 Safari/537.36"
                 ),
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
@@ -2316,7 +2356,7 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -3095,7 +3135,7 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -3646,7 +3686,7 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -4257,6 +4297,11 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
         try:
             if context is not None:
                 context.close()
+                # v8.4.13: context.close() 返回时 chrome 进程可能仍在异步
+                # flush Cookies SQLite 到磁盘，紧接 p.stop() 硬杀 driver 会
+                # 打断 flush → 用户"总是掉登录"。给 chrome 退出留时间。
+                import time as _t
+                _t.sleep(1.0)
         except Exception:
             pass
         try:
@@ -4266,6 +4311,40 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
             pass
         p = None
         context = None
+
+    def _launch_fresh(target_url, data_dir, chrome_exe_path):
+        """全新启动浏览器并导航（在 worker 线程内调用）。"""
+        nonlocal p, context
+        from playwright.sync_api import sync_playwright
+        p = sync_playwright().start()
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=data_dir,
+            headless=False,
+            executable_path=chrome_exe_path,
+            viewport={"width": 1280, "height": 800},
+            args=[
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+            ],
+            ignore_default_args=["--no-sandbox"],
+            timeout=30000,
+        )
+        # 首次启动：复用初始 New Tab Page，避免双 tab
+        pages = context.pages
+        if pages:
+            initial = pages[0]
+            try:
+                initial.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            try:
+                initial.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                try:
+                    initial.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
 
     while True:
         try:
@@ -4278,52 +4357,29 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
         try:
             if cmd == "open":
                 target_url, data_dir, chrome_exe_path = payload
-                # 1. 探测现有 context 健康（用户可能手动关了浏览器窗口）
+                # v8.4.13: 健康探测改为**直接试 new_page**（探测与创建合一）。
+                # v8.4.12 用 `_ = context.pages` 探测——用户手动关闭浏览器窗口后，
+                # context.pages 返回的是 Playwright 端缓存的列表，不抛异常，
+                # 导致"手动关窗后第一次打开失败，第二次才成功"。
+                page = None
                 if context is not None:
                     try:
-                        _ = context.pages
+                        page = context.new_page()
                     except Exception:
+                        # chrome 已被用户手动关闭 → 重启浏览器
                         _teardown()
-                # 2. 无 context → 全新启动
                 if context is None:
-                    from playwright.sync_api import sync_playwright
-                    p = sync_playwright().start()
-                    context = p.chromium.launch_persistent_context(
-                        user_data_dir=data_dir,
-                        headless=False,
-                        executable_path=chrome_exe_path,
-                        viewport={"width": 1280, "height": 800},
-                        args=[
-                            "--no-first-run",
-                            "--no-default-browser-check",
-                            "--disable-blink-features=AutomationControlled",
-                        ],
-                        ignore_default_args=["--no-sandbox"],
-                        timeout=30000,
-                    )
-                    # 首次启动：复用初始 New Tab Page，避免双 tab
-                    pages = context.pages
-                    if pages:
-                        initial = pages[0]
-                        try:
-                            initial.wait_for_load_state("domcontentloaded", timeout=10000)
-                        except Exception:
-                            pass
-                        try:
-                            initial.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                        except Exception:
-                            try:
-                                initial.goto(target_url, wait_until="commit", timeout=15000)
-                            except Exception:
-                                pass
-                        result["ok"] = True
-                        result["error"] = ""
-                        ev.set()
-                        continue
-                # 3. 复用：清理 about:blank 残留 page（goto 失败时 Chrome 端 tab 残留）
+                    _launch_fresh(target_url, data_dir, chrome_exe_path)
+                    result["ok"] = True
+                    result["error"] = ""
+                    ev.set()
+                    continue
+                # 复用：清理 about:blank 残留 page（goto 失败时 Chrome 端 tab 残留）
                 try:
                     for old_page in list(context.pages):
                         try:
+                            if old_page is page:
+                                continue
                             url = old_page.url if not old_page.is_closed() else ""
                             if url and url in ("about:blank", "chrome://newtab/", "chrome://newtab"):
                                 try:
@@ -4334,8 +4390,7 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
                             pass
                 except Exception:
                     pass
-                # 4. 开新 tab 并导航
-                page = context.new_page()
+                # 新 tab 导航
                 page.set_default_navigation_timeout(20000)
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -4389,34 +4444,59 @@ def _shared_pw_command(cmd: str, payload=None, timeout: float = 40.0) -> tuple:
     return False, f"worker 命令超时: {cmd}"
 
 
-def _wait_singleton_lock_released(data_dir: str, timeout: float = 6.0) -> bool:
-    """轮询等待 Chrome SingletonLock 文件可删除（即锁已释放）。
+def _count_chrome_by_profile(profile_key: str) -> int:
+    """计数使用指定 profile 目录的 chrome.exe 进程数（按 CommandLine 过滤）。
 
-    context.close() 返回不代表 chrome.exe 已完全退出，文件锁可能还持有
-    几百毫秒到几秒。fetch 启动新 chrome 前必须确认锁真正释放，
-    否则新进程会 fallback 到临时空 Profile（cookie 丢失）。
+    用 PowerShell Get-CimInstance 精确匹配，不会误伤用户自己的 Chrome。
+    返回 -1 表示查询失败（保守处理）。
+    """
+    try:
+        NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        ps_cmd = (
+            "(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+            f"Where-Object {{ $_.CommandLine -like '*{profile_key}*' }}).Count"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, creationflags=NO_WINDOW,
+        )
+        out = (r.stdout or "").strip()
+        return int(out) if out.isdigit() else -1
+    except Exception:
+        return -1
+
+
+def _wait_singleton_lock_released(data_dir: str, timeout: float = 8.0) -> bool:
+    """轮询等待使用 data_dir 的 chrome 进程完全退出（cookie flush 到磁盘）。
+
+    v8.4.12 的实现是"尝试删除 SingletonLock 文件"——严重缺陷：
+    chrome 退出过程中锁文件可能提前变为可删，甚至被本函数主动删掉，
+    导致新 chrome 在旧 chrome 还没 flush Cookies SQLite 到磁盘时就启动，
+    两个进程写同一 profile → Cookies 数据库竞争损坏 → 用户"总是掉登录"。
+
+    v8.4.13 改为等**进程真正退出**（PowerShell 按 CommandLine 过滤计数为 0），
+    进程退出后才清理残留的锁文件（此时删除是安全的）。
 
     Returns:
-        True = 锁已释放；False = 超时仍被占用
+        True = 进程已全部退出；False = 超时仍有残留
     """
     import time as _time
     deadline = _time.time() + timeout
-    lock_files = [
-        os.path.join(data_dir, "SingletonLock"),
-        os.path.join(data_dir, "SingletonSocket"),
-        os.path.join(data_dir, "SingletonCookie"),
-    ]
+    profile_key = os.path.basename(data_dir.rstrip("\\/"))  # "shared_browser_data"
     while _time.time() < deadline:
-        all_gone = True
-        for lf in lock_files:
-            if os.path.exists(lf):
-                try:
-                    os.remove(lf)
-                except OSError:
-                    all_gone = False  # 文件被占用 → 锁未释放
-        if all_gone:
+        cnt = _count_chrome_by_profile(profile_key)
+        if cnt == 0:
+            # 进程已全部退出，安全清理残留锁文件
+            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                lf = os.path.join(data_dir, lock_name)
+                if os.path.exists(lf):
+                    try:
+                        os.remove(lf)
+                    except OSError:
+                        pass
             return True
-        _time.sleep(0.3)
+        _time.sleep(0.4)
     return False
 
 
@@ -7309,7 +7389,7 @@ class LocalStreamProxy:
             req_headers = {
                 "Referer": self._referer,
                 "Origin": self._origin,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "Accept-Encoding": "identity",
@@ -7392,7 +7472,7 @@ class LocalStreamProxy:
             header_lines.append(f"Referer: {self._referer}")
         header_lines.append(
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
         )
         custom_headers = "\r\n".join(header_lines) + "\r\n"
 
@@ -9169,7 +9249,7 @@ class LiveStreamFetcherApp:
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -9381,7 +9461,7 @@ class LiveStreamFetcherApp:
                 "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
+                    "Chrome/143.0.0.0 Safari/537.36"
                 ),
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
@@ -9634,7 +9714,7 @@ class LiveStreamFetcherApp:
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,
@@ -9837,7 +9917,7 @@ class LiveStreamFetcherApp:
                 "headless": False,
                 "args": launch_args,
                 "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
                 "ignore_default_args": ["--enable-automation"],
                 "chromium_sandbox": False,  # v8.2.4 禁用 chromium 沙箱（Windows 上默认沙箱可能导致启动失败）
                 "no_viewport": False,

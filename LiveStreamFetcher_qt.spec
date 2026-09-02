@@ -42,12 +42,12 @@ datas = [
     # v8.3.7: 完整 app_icon.ico（EXE 资源图标 + 任务栏图标，多尺寸 256/128/64/48/32/16）
     ('app_icon.ico', '.'),
     # 嵌入式 Chromium（Playwright 浏览器，跨电脑分发不依赖系统浏览器）
-    (r'C:\Users\15346\AppData\Local\ms-playwright\chromium-1208\chrome-win64', 'embedded_chromium'),
+    (r'vendor\\chrome-win64', 'embedded_chromium'),  # v8.4.13: Chrome for Testing 143
     # 嵌入式 ffmpeg（HEVC 转码）
     (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
     # 微信视频号下载工具（2.8 版本）
     (r'wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),
-    (r'wechatVideoDownload2.8\缓存', 'wechat_video_tool'),
+    (r'wechatVideoDownload2.8\缓存', r'wechat_video_tool\缓存'),
 ]
 
 datas += collect_data_files('yt_dlp')
