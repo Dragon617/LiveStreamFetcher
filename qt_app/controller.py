@@ -115,6 +115,8 @@ class ProxyStartWorker(QThread):
                     platform=self.platform,
                     codec_hint=s.get("codec", ""),
                 )
+                # v8.5.4: 虎牙注入同档备用线路（代理上游 403 时轮换，规避单 URL 连接配额）
+                proxy.alt_urls = s.get("alt_urls") or []
                 local_url = proxy.start(url)
                 self._proxies.append(proxy)
                 proxy_map[url] = local_url

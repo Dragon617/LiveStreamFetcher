@@ -4550,6 +4550,18 @@ def fetch_huya(url: str, proxy: str = "") -> dict:
         }))
     # 同分辨率内按线路优先级排序（分辨率排序由 _sort_streams 负责）
     streams = [s for _, s in sorted(raw_streams, key=lambda t: t[0])]
+
+    # v8.5.4: 同（分辨率, 码率）的不同线路互为备用——代理在上游 403 时
+    # 轮换线路规避单 URL 连接配额（虎牙对单 URL 有连接频率限制）
+    def _qr_key(quality: str):
+        m_q = re.match(r'(\d+)p·', quality or "")
+        m_r = re.search(r'·(\d+(?:\.\d+)?)M', quality or "")
+        return (m_q.group(1) if m_q else "", m_r.group(1) if m_r else "")
+    _by_qr = {}
+    for _s in streams:
+        _by_qr.setdefault(_qr_key(_s["quality"]), []).append(_s["url"])
+    for _s in streams:
+        _s["alt_urls"] = [u for u in _by_qr.get(_qr_key(_s["quality"]), []) if u != _s["url"]]
     if not streams and (info or {}).get("url"):
         furl = info["url"]
         streams.append({
@@ -8122,16 +8134,17 @@ class LocalStreamProxy:
             return
 
         # 小红书统一走 ffmpeg（xhscdn.com CDN 兼容性问题 + 鉴权头需求）
-        # v8.5.3: 虎牙也统一走 ffmpeg——反盗链断流需要 ffmpeg 自动重连参数
-        # （requests 转发路径断流即终止，OBS 表现为卡顿黑屏）
+        # v8.5.4: 虎牙改走 burst 循环拼接——实测虎牙 FLV 每个连接只发一段
+        # (~0.6-1MB) 即断流（直连 OBS 播 1-2 秒黑屏），官方 MSE 播放器靠
+        # 连续重拉分段维持；ffmpeg -reconnect 无法去除后续分段的 FLV 头，
+        # 必须 Python 层循环拼接
         # HEVC 转码模式也统一走 ffmpeg
-        if self._platform in ("小红书", "虎牙") or self._codec_hint == "hevc":
-            if self._platform == "小红书":
-                reason = "小红书平台"
-            elif self._platform == "虎牙":
-                reason = "虎牙平台(自动重连)"
-            else:
-                reason = "HEVC转码模式"
+        if self._platform == "虎牙":
+            print("[代理] 虎牙平台，使用 burst 循环拼接拉流...")
+            self._serve_via_burst_loop(client_sock)
+            return
+        if self._platform == "小红书" or self._codec_hint == "hevc":
+            reason = "小红书平台" if self._platform == "小红书" else "HEVC转码模式"
             print(f"[代理] {reason}，统一使用 ffmpeg 拉流...")
             self._serve_via_ffmpeg(client_sock, force_transcode=(self._codec_hint == "hevc"))
             return
@@ -8194,6 +8207,167 @@ class LocalStreamProxy:
                 self._send_error(client_sock, 500, f"Proxy error: {e}")
             except Exception:
                 pass
+
+    def _serve_via_burst_loop(self, client_sock):
+        """虎牙专用：burst 循环拉流 + FLV 头剥离拼接。
+
+        背景（v8.5.4 实测）：虎牙 FLV 反盗链策略为每个 HTTP 连接只发送一段
+        数据（~0.6-1MB，约 1-2 秒画面）便断开/停止，直连 OBS 只能播 1-2 秒
+        即黑屏。官方 MSE 播放器（dMod=mseh）通过连续重新请求分段并在前端
+        拼接维持播放。本方法模拟该行为：
+
+          1. 循环向上游发起 GET，每段 burst 读到 EOF 后立即重连
+          2. 首个 burst 原样转发（含完整 FLV 头）
+          3. 后续 burst 跳过前 13 字节（FLV 头 9B + PreviousTagSize0 4B），
+             仅追加媒体 Tag——重复出现的 onMetaData/AVC sequence header
+             对解码无害（OBS 需要新的 sequence header 才能继续解码）
+          4. 连续 403（签名过期）时重试数次后放弃；OBS 断线时立即停止
+
+        OBS 端表现：持续流畅播放，分段切换瞬间可能有亚秒级跳帧。
+        """
+        import time as _time
+
+        # 1. 先给 OBS 发 HTTP 响应头
+        try:
+            client_sock.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: video/x-flv\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+        except Exception:
+            return
+
+        req_headers = {
+            "Referer": self._referer or "https://www.huya.com/",
+            "Origin": self._origin or "https://www.huya.com",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                          "Version/16.6 Mobile/15E148 Safari/604.1",
+            "Accept": "*/*",
+        }
+
+        burst_idx = 0
+        consecutive_403 = 0
+        total_bytes = 0
+        t_start = _time.time()
+
+        # 码率估算：URL ratio 参数 = kbps（虎牙惯例），缺省 4000。
+        # 用于按"实时速率"节流重连——每段含 burst_bytes/bitrate 秒画面，
+        # 按同节奏重连可规避上游连接频率风控（403 集群）。
+        _m_ratio = re.search(r'[?&]ratio=(\d+)', self._target_url)
+        _bitrate_bps = (int(_m_ratio.group(1)) if _m_ratio else 4000) * 1000 / 8.0  # 字节/秒
+
+        # 线路轮换池（v8.5.4）：主 URL + 同清晰度其他 CDN 线路。
+        # 实测虎牙对单 URL 有连接配额（连续 6-7 段后强制 403 冷却），
+        # 403 时立即切换到下一条线路（不同边缘节点配额独立），
+        # 全部线路同时 403 才退避。alt_urls 由调用方按属性注入（防混淆安全）。
+        _url_pool = [self._target_url]
+        for _au in (getattr(self, "alt_urls", None) or []):
+            if isinstance(_au, str) and _au.startswith("http") and _au not in _url_pool:
+                _url_pool.append(_au)
+        _pool_idx = 0
+        _pool_fail_rounds = 0
+
+        while self._running:
+            _cur_url = _url_pool[_pool_idx % len(_url_pool)]
+            try:
+                resp = requests.get(
+                    _cur_url,
+                    headers=req_headers,
+                    stream=True,
+                    timeout=(10, 20),
+                    allow_redirects=True,
+                )
+            except Exception as e:
+                print(f"[代理-burst] 连接异常（{str(e)[:60]}），0.5s 后重连")
+                _time.sleep(0.5)
+                continue
+
+            if resp.status_code != 200:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                # 有备用线路：立即轮换（各边缘节点配额独立），无需退避
+                if len(_url_pool) > 1:
+                    _pool_idx += 1
+                    if _pool_idx % len(_url_pool) == 0:
+                        _pool_fail_rounds += 1
+                        print(f"[代理-burst] 全线路 {resp.status_code}（第 {_pool_fail_rounds} 轮）")
+                        if _pool_fail_rounds >= 4:
+                            print("[代理-burst] 多轮全线路 403，签名可能已过期，停止")
+                            break
+                        _time.sleep(min(2.0 * _pool_fail_rounds, 8.0))
+                    else:
+                        print(f"[代理-burst] {resp.status_code} → 轮换线路 {_pool_idx % len(_url_pool)}")
+                else:
+                    consecutive_403 += 1
+                    print(f"[代理-burst] 上游 {resp.status_code}（第 {consecutive_403} 次）")
+                    if consecutive_403 >= 8:
+                        print("[代理-burst] 连续 403，签名可能已过期，停止（OBS 重连将重试）")
+                        break
+                    _time.sleep(min(2.0 * consecutive_403, 10.0))
+                continue
+
+            consecutive_403 = 0
+            _pool_fail_rounds = 0
+
+            consecutive_403 = 0
+            burst_bytes = 0
+            # 后续分段剥离 FLV 头（9B 头 + 4B PreviousTagSize0 = 13B）。
+            # 仅当分段确实以 "FLV\x01" 魔数开头才剥离，防错位（部分 burst
+            # 可能直接续传裸 Tag 数据）。
+            skip = 13 if burst_idx > 0 else 0
+            head_checked = (burst_idx == 0)
+            burst_t0 = _time.time()
+            try:
+                for chunk in resp.iter_content(65536):
+                    if not self._running:
+                        break
+                    if not chunk:
+                        continue
+                    if not head_checked:
+                        head_checked = True
+                        if not chunk.startswith(b"FLV\x01"):
+                            skip = 0   # 无 FLV 头，原样续传
+                    if skip:
+                        if len(chunk) <= skip:
+                            skip -= len(chunk)
+                            continue
+                        chunk = chunk[skip:]
+                        skip = 0
+                    try:
+                        client_sock.sendall(chunk)
+                    except Exception:
+                        print("[代理-burst] OBS 端已断开，停止拉流")
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        return
+                    burst_bytes += len(chunk)
+                    total_bytes += len(chunk)
+            except Exception as e:
+                print(f"[代理-burst] 分段读取中断（{str(e)[:60]}）")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+            el = _time.time() - t_start
+            burst_cost = _time.time() - burst_t0
+            print(f"[代理-burst] 第 {burst_idx} 段 {burst_bytes} 字节 | "
+                  f"累计 {total_bytes/1024/1024:.2f} MB | {el:.1f}s")
+            burst_idx += 1
+            # 按实时速率节流：每段含 burst_bytes/bitrate 秒画面，重连节奏与
+            # 之一致即呈现"正常播放器"行为；立即重连（约 3 次/秒）会触发上游
+            # 连接频率风控（403 集群）。最少 0.3 秒避免异常快转。
+            _video_sec = burst_bytes / _bitrate_bps if _bitrate_bps > 0 else 2.0
+            _time.sleep(max(0.3, _video_sec - burst_cost))
+
+        print(f"[代理-burst] 结束：共 {burst_idx} 段，{total_bytes/1024/1024:.2f} MB")
 
     def _serve_via_ffmpeg(self, client_sock, force_transcode: bool = True):
         """用 ffmpeg 直接拉取直播流并输出 FLV 给客户端。
