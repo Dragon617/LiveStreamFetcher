@@ -573,6 +573,11 @@ def _ensure_chromium_ready():
 
     返回 chromium 目录路径（包含 chrome.exe），失败返回 None。
     """
+    # v8.5.0: 用户选择「电脑自带浏览器」时跳过内嵌浏览器——
+    # 各 fetch 启动链收到 None 后自动落到 channel="chrome"/"msedge"。
+    if _prefer_system_browser():
+        return None
+
     # 先检查便携目录和 AppData
     path = _get_embedded_chromium_path()
     if path:
@@ -787,7 +792,7 @@ def _ks_fetch_via_playwright(url, room_id):
                 try:
                     context = p.chromium.launch_persistent_context(
                         user_data_dir,
-                        channel=None,
+                        channel=_first_fallback_channel(),
                         **launch_kwargs,
                     )
                 except Exception as e1:
@@ -1656,7 +1661,7 @@ def _dy_fetch_via_playwright(url: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=None, **launch_kwargs,
+                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -2383,7 +2388,7 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=None, **launch_kwargs,
+                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -3162,7 +3167,7 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=None, **launch_kwargs,
+                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -3713,7 +3718,7 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=None, **launch_kwargs,
+                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -4452,9 +4457,11 @@ def _count_chrome_by_profile(profile_key: str) -> int:
     """
     try:
         NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        # v8.5.0: 同时匹配 msedge.exe（系统浏览器模式下可能用 Edge 启动）
         ps_cmd = (
-            "(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-            f"Where-Object {{ $_.CommandLine -like '*{profile_key}*' }}).Count"
+            "(Get-CimInstance Win32_Process | "
+            "Where-Object { ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and "
+            f"$_.CommandLine -like '*{profile_key}*' }}).Count"
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
@@ -4602,6 +4609,107 @@ def _get_app_cache_dir(subdir: str = "") -> str:
     return target
 
 
+# ═══════════════════════════════════════════════════════
+# v8.5.0: 浏览器引擎设置（内置 Chrome for Testing vs 系统浏览器）
+# 配置持久化在缓存根目录 settings.json，UI（Qt 设置对话框）与
+# 业务层共用。所有 Playwright 启动点据此选择浏览器二进制。
+# ═══════════════════════════════════════════════════════
+_BROWSER_ENGINE_CACHE = None   # 内存缓存: "builtin" | "system"
+
+
+def _get_browser_engine() -> str:
+    """读取浏览器引擎设置：builtin（软件内置浏览器）| system（电脑自带浏览器）。"""
+    global _BROWSER_ENGINE_CACHE
+    if _BROWSER_ENGINE_CACHE is not None:
+        return _BROWSER_ENGINE_CACHE
+    engine = "builtin"
+    try:
+        settings_file = os.path.join(_get_app_cache_dir(), "settings.json")
+        with open(settings_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("browser_engine") in ("builtin", "system"):
+            engine = data["browser_engine"]
+    except Exception:
+        pass
+    _BROWSER_ENGINE_CACHE = engine
+    return engine
+
+
+def _set_browser_engine(engine: str) -> bool:
+    """保存浏览器引擎设置（builtin | system）。返回是否成功。"""
+    global _BROWSER_ENGINE_CACHE
+    if engine not in ("builtin", "system"):
+        return False
+    try:
+        settings_file = os.path.join(_get_app_cache_dir(), "settings.json")
+        data = {}
+        try:
+            with open(settings_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+        data["browser_engine"] = engine
+        with open(settings_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        _BROWSER_ENGINE_CACHE = engine
+        return True
+    except Exception:
+        return False
+
+
+def _prefer_system_browser() -> bool:
+    """用户是否选择了「电脑自带浏览器」。"""
+    return _get_browser_engine() == "system"
+
+
+def _find_system_browser_exe() -> str:
+    """查找电脑自带浏览器可执行文件完整路径（优先 Chrome → Edge）。
+
+    查找顺序：注册表 App Paths（HKLM/HKCU）→ 常见安装路径。
+    返回 "" 表示未找到。
+    """
+    candidates = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for sub, name in (
+                    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe", "chrome"),
+                    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe", "msedge"),
+                ):
+                    try:
+                        with winreg.OpenKey(root, sub) as k:
+                            p, _ = winreg.QueryValueEx(k, None)
+                            if p and os.path.isfile(p):
+                                candidates.append((name, p))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        for name, p in (
+            ("chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            ("chrome", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            ("msedge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            ("msedge", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+        ):
+            if os.path.isfile(p):
+                candidates.append((name, p))
+    for name, p in candidates:
+        if name == "chrome":
+            return p
+    return candidates[0][1] if candidates else ""
+
+
+def _first_fallback_channel():
+    """fetch 启动链的首个 fallback channel。
+
+    内置模式：None（Playwright 自带 Chromium，开发环境用）。
+    系统浏览器模式：直接 "chrome"——跳过无编解码器的 Playwright Chromium，
+    避免选错浏览器导致直播页面视频加载不出。
+    """
+    return "chrome" if _prefer_system_browser() else None
+
+
 # v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
 def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
     """多次轮询 taskkill /IM chrome.exe + node.exe（playwright driver），
@@ -4621,6 +4729,13 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
 
     NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
+    # v8.5.0: 只匹配「本软件启动的 chrome」的 CommandLine 特征。
+    # 旧实现 taskkill /F /IM chrome.exe 会连用户自己的 Chrome 浏览器一起杀掉
+    # （标签页丢失 + 用户 Chrome profile 可能损坏）。系统浏览器模式下本软件
+    # 启动的也是 chrome.exe/msedge.exe，必须按启动参数精确区分。
+    _OUR_CHROME_KEYS = ("shared_browser_data", "embedded_chromium", "chrome-win64")
+    _ps_filter = " -or ".join(f"$_.CommandLine -like '*{k}*'" for k in _OUR_CHROME_KEYS)
+
     def _kill_playwright_node() -> None:
         """精确杀掉 playwright 相关的 node.exe（通过 CommandLine 含 playwright 筛选，
         避免误杀用户的其它 node 进程）。"""
@@ -4637,19 +4752,38 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
         except Exception:
             pass
 
-    def _count_chrome() -> int:
-        """用 tasklist 计数残留 chrome.exe 进程数。"""
+    def _kill_our_chrome() -> None:
+        """v8.5.0: 只杀本软件启动的 chrome/msedge（CommandLine 含我们的
+        profile 路径或内嵌浏览器路径），绝不碰用户自己的浏览器。"""
         try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and "
+                f"({_ps_filter}) }} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, timeout=15, creationflags=NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+    def _count_chrome() -> int:
+        """v8.5.0: 只计数本软件启动的 chrome/msedge 进程数。"""
+        try:
+            ps_cmd = (
+                "(Get-CimInstance Win32_Process | "
+                "Where-Object { ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and "
+                f"({_ps_filter}) }}).Count"
+            )
             r = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH", "/FO", "CSV"],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=10, creationflags=NO_WINDOW,
+                timeout=15, creationflags=NO_WINDOW,
             )
             out = (r.stdout or "").strip()
-            if not out or "INFO: No tasks" in out:
-                return 0
-            lines = [ln for ln in out.splitlines() if ln.strip()]
-            return len(lines)
+            return int(out) if out.isdigit() else -1
         except Exception:
             return -1
 
@@ -4678,18 +4812,12 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
     _kill_playwright_node()
 
     for round_idx in range(max_rounds):
-        # 1. 强制 taskkill chrome.exe + node.exe
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-                capture_output=True, timeout=10, creationflags=NO_WINDOW,
-            )
-        except Exception:
-            pass
+        # 1. 强制杀本软件的 chrome/msedge + node.exe（v8.5.0: 不误伤用户浏览器）
+        _kill_our_chrome()
         # 每轮都补杀 playwright node（driver 可能重连）
         _kill_playwright_node()
 
-        # 2. 立即计数（taskkill 后大部分已退出）
+        # 2. 立即计数（kill 后大部分已退出）
         after_kill = _count_chrome()
         if after_kill == 0:
             break
@@ -4700,14 +4828,8 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
         if after_wait == 0:
             break
 
-    # 4. 兜底：再 taskkill 一次 + 杀 playwright node
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-            capture_output=True, timeout=5, creationflags=NO_WINDOW,
-        )
-    except Exception:
-        pass
+    # 4. 兜底：再杀一次本软件的 chrome + playwright node
+    _kill_our_chrome()
     _kill_playwright_node()
 
     # 5. v8.4.12 关键：轮询等 playwright node.exe 真正退到 0（最多 ~10 秒）
@@ -4833,10 +4955,18 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     if platform_key not in _PLATFORM_BROWSER_MAP:
         return False, f"不支持的平台: {platform_key}"
 
-    # chrome.exe 路径
-    browser_path = _ensure_chromium_ready()
-    if not browser_path:
-        return False, "chromium 未找到，请确认内嵌 chromium 已打包"
+    # chrome.exe 路径（v8.5.0: 支持「电脑自带浏览器」设置）
+    if _prefer_system_browser():
+        _sys_exe = _find_system_browser_exe()
+        if not _sys_exe:
+            return False, "未找到系统 Chrome/Edge 浏览器，请安装 Chrome 或在设置中改回内置浏览器"
+        browser_path = os.path.dirname(_sys_exe)
+        _chrome_exe_path = _sys_exe
+    else:
+        browser_path = _ensure_chromium_ready()
+        if not browser_path:
+            return False, "chromium 未找到，请确认内嵌 chromium 已打包"
+        _chrome_exe_path = os.path.join(browser_path, "chrome.exe")
 
     # 共享 data_dir（所有平台 cookie 都存在这里，Chrome 按 URL 域名隔离）
     data_dir = _get_app_cache_dir("shared_browser_data")
@@ -4856,7 +4986,6 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         _open_platform_in_chromium._popen_patched = True
 
     # 通过 worker 线程执行 open（launch 或复用 + 新 tab 导航）
-    _chrome_exe_path = os.path.join(browser_path, "chrome.exe")
     ok, err = _shared_pw_command(
         "open",
         payload=(target_url, data_dir, _chrome_exe_path),
@@ -9277,7 +9406,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=None, **launch_kwargs,
+                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -9489,7 +9618,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=None, **launch_kwargs,
+                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -9742,7 +9871,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=None, **launch_kwargs,
+                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -9945,7 +10074,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=None, **launch_kwargs,
+                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
                         )
                     except Exception:
                         try:

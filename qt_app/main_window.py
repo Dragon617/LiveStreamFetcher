@@ -21,6 +21,7 @@ from .theme import Colors, PLATFORM_META, APP_VERSION_FULL
 from .widgets.stream_card import StreamCard
 from .controller import FetchWorker, LoginCheckWorker, ProxyStartWorker
 from .transcode_dialog import TranscodeDialog
+from .settings_dialog import SettingsDialog
 
 
 def _icon_path(relative: str) -> str:
@@ -262,6 +263,14 @@ class MainWindow(QMainWindow):
         self.wechat_btn.setMinimumHeight(40)
         self.wechat_btn.clicked.connect(self._on_wechat_tool)
         row.addWidget(self.wechat_btn)
+
+        # 设置（灰色，v8.5.0：浏览器引擎等软件设置）
+        self.settings_btn = QPushButton("设置")
+        self.settings_btn.setObjectName("settingsBtn")
+        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.setMinimumHeight(40)
+        self.settings_btn.clicked.connect(self._on_settings_clicked)
+        row.addWidget(self.settings_btn)
 
         row.addStretch(1)
         return row
@@ -529,6 +538,12 @@ class MainWindow(QMainWindow):
     def _on_transcode_clicked(self):
         dlg = TranscodeDialog(parent=self)
         dlg.exec()
+
+    def _on_settings_clicked(self):
+        """v8.5.0: 打开设置对话框（浏览器引擎等）。"""
+        dlg = SettingsDialog(parent=self)
+        if dlg.exec():
+            self.platform_info_label.setText("设置已保存，下次打开浏览器时生效")
 
     def _on_proxy_clicked(self):
         self.platform_info_label.setText("解析淘宝/小红书流后自动启动本地代理")

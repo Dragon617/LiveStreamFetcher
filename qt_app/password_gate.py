@@ -17,6 +17,17 @@ from PySide6.QtGui import QFont
 from .theme import Colors
 from .controller import PasswordFetchWorker
 
+# v8.5.0: 仍在运行的 worker 全局持有列表（防 GC 销毁运行中 QThread → abort 闪退）
+_ALIVE_WORKERS = []
+
+
+def _safe_discard(worker):
+    """worker finished 后从全局持有列表移除（允许 GC）。"""
+    try:
+        _ALIVE_WORKERS.remove(worker)
+    except ValueError:
+        pass
+
 
 class PasswordGate(QDialog):
     """密码验证对话框。"""
@@ -33,6 +44,8 @@ class PasswordGate(QDialog):
         self._prefetch_done = False
         self._loading = False
         self._worker = None
+        # v8.5.0: 待验证的密码输入（预取未完成时用户已点验证 → 等预取结果再比对）
+        self._pending_input = None
 
         self._build_ui()
 
@@ -132,7 +145,13 @@ class PasswordGate(QDialog):
 
     # ── 预取密码 ──
     def _start_prefetch(self):
-        worker = PasswordFetchWorker()
+        # v8.5.0 闪退修复：全程只持有一个 worker 实例。
+        # 旧实现在 _verify 里覆盖 self._worker 新建第二个 QThread，
+        # 预取 worker（仍在运行）失去引用被 GC → Qt abort
+        # "QThread: Destroyed while thread is still running" → 进程闪退。
+        if self._worker is not None and self._worker.isRunning():
+            return  # 已有 worker 在跑，不重复创建
+        worker = PasswordFetchWorker(self)  # parent=self：随对话框析构
         worker.ready.connect(self._on_prefetch_ready)
         self._worker = worker
         worker.start()
@@ -141,6 +160,16 @@ class PasswordGate(QDialog):
         self._prefetch_done = True
         if pwd:
             self._prefetched_pwd = pwd
+        # v8.5.0: 用户在等待期间已提交密码 → 用预取结果完成比对
+        if self._pending_input is not None:
+            user_input, self._pending_input = self._pending_input, None
+            self._set_loading(False)
+            if not pwd:
+                self._on_fail(f"无法获取密码：{diag}")
+            elif user_input == pwd:
+                self._on_success()
+            else:
+                self._on_fail("密码错误，请重新输入")
 
     # ── 验证 ──
     def _verify(self):
@@ -161,26 +190,14 @@ class PasswordGate(QDialog):
                 self._on_fail("密码错误，请重新输入")
             return
 
-        # 预取未就绪 → 网络拉取
+        # v8.5.0: 预取未就绪 → 挂起本次输入，等唯一 worker 的 ready 信号
+        # （不再新建第二个 QThread —— 旧实现覆盖引用导致运行中线程被 GC 闪退）
+        self._pending_input = user_input
         self._set_loading(True)
         self.error_label.setText("正在从云端获取密码...")
-
-        worker = PasswordFetchWorker()
-        worker.ready.connect(
-            lambda pwd, diag: self._on_network_verify(user_input, pwd, diag)
-        )
-        self._worker = worker
-        worker.start()
-
-    def _on_network_verify(self, user_input: str, pwd: str, diag: str):
-        self._set_loading(False)
-        if not pwd:
-            self._on_fail(f"无法获取密码：{diag}")
-            return
-        if user_input == pwd:
-            self._on_success()
-        else:
-            self._on_fail("密码错误，请重新输入")
+        # 预取线程意外未启动/已结束但未 ready → 兜底重启一个
+        if self._worker is None or not self._worker.isRunning():
+            self._start_prefetch()
 
     def _on_success(self):
         self._loading = False
@@ -198,3 +215,20 @@ class PasswordGate(QDialog):
         self._loading = loading
         self.verify_btn.setEnabled(not loading)
         self.verify_btn.setText("验证中..." if loading else "验证")
+
+    # ── 关闭安全（v8.5.0）──
+    def closeEvent(self, event):
+        """用户直接关闭密码窗（取消登录）时，安全处理仍在运行的预取线程。
+
+        不处理的话：对话框销毁 → worker 引用丢失 → 运行中的 QThread 被 GC
+        → Qt abort 闪退。这里先把线程引用挂到模块级列表（由 finished 信号
+        自动移除），保证线程对象活到 run() 结束。
+        """
+        w = self._worker
+        if w is not None and w.isRunning():
+            _ALIVE_WORKERS.append(w)
+            try:
+                w.finished.connect(lambda: _safe_discard(w))
+            except Exception:
+                pass
+        super().closeEvent(event)

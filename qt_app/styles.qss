@@ -166,6 +166,19 @@ QPushButton#wechatBtn {
 QPushButton#wechatBtn:hover { background: #06ad56; }
 QPushButton#wechatBtn:pressed { background: #059048; }
 
+/* 设置（灰色） */
+QPushButton#settingsBtn {
+    background: #64748b;
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: bold;
+}
+QPushButton#settingsBtn:hover { background: #7484a0; }
+QPushButton#settingsBtn:pressed { background: #526179; }
+
 /* ---------- 结果区 ---------- */
 #resultTitle {
     font-size: 14px;

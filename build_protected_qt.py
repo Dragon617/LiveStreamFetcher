@@ -136,6 +136,101 @@ exe = EXE(
 '''
 
 
+# ─── onedir（文件夹版）spec 模板 ───
+# v8.5.0: 解决 onefile 每次启动解压 ~600MB 到 C 盘 Temp（_MEIxxxxxx）的问题——
+# 文件夹版所有文件常驻 EXE 旁，零解压、零 _MEI、启动更快，
+# 也不会再出现 "Failed to remove temporary directory" 警告。
+QT_SPEC_TEMPLATE_ONEDIR = r'''# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_submodules
+
+datas = [
+    (r'qt_app\styles.qss', 'qt_app'),
+    (r'{project_dir}\VERSION', '.'),
+    (r'{project_dir}\icons\dy_real.png', 'icons'),
+    (r'{project_dir}\icons\ks_real.png', 'icons'),
+    (r'{project_dir}\icons\tb_real.png', 'icons'),
+    (r'{project_dir}\icons\xhs_real.png', 'icons'),
+    (r'{project_dir}\icons\yy_real.png', 'icons'),
+    (r'{project_dir}\icons\logo_main.png', 'icons'),
+    (r'{project_dir}\app_icon.ico', '.'),
+    (r'{project_dir}\vendor\chrome-win64', 'embedded_chromium'),
+    (r'C:\ffmpeg\bin', 'embedded_ffmpeg'),
+    (r'{project_dir}\wechatVideoDownload2.8\微信视频号下载工具2.8.exe', 'wechat_video_tool'),
+    (r'{project_dir}\wechatVideoDownload2.8\缓存', r'wechat_video_tool\缓存'),
+]
+hiddenimports = [
+    '_threading_local',
+    'live_stream_fetcher',
+    'yt_dlp', 'yt_dlp.extractor', 'yt_dlp.extractor.common',
+    'yt_dlp.extractor.douyin', 'yt_dlp.extractor.kuaishou',
+    'yt_dlp.extractor.xiaohongshu', 'yt_dlp.extractor.taobao',
+    'yt_dlp.extractor.wechat', 'yt_dlp.extractor.generic',
+    'yt_dlp.extractor.youtube', 'yt_dlp.extractor.lazy_extractors',
+    'yt_dlp.postprocessor', 'yt_dlp.downloader', 'yt_dlp.utils',
+    'yt_dlp.version', 'yt_dlp.compat', 'yt_dlp.cookies',
+    'playwright', 'playwright.sync_api',
+    'greenlet', 'greenlet._greenlet',
+    'requests', 'requests.adapters', 'requests.cookies', 'requests.utils',
+    'urllib3', 'certifi', 'charset_normalizer', 'idna',
+    'winreg',
+    'PIL', 'PIL.Image', 'PIL.ImageTk', 'PIL._tkinter_finder',
+    'io',
+]
+datas += collect_data_files('yt_dlp')
+datas += collect_data_files('certifi')
+hiddenimports += collect_submodules('yt_dlp')
+
+a = Analysis(
+    [r'{build_dir}\qt_main.py'],
+    pathex=[r'{build_dir}'],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes=['tkinter.test', 'unittest', 'pydoc', 'doctest', 'pdb',
+              'lib2to3', 'pyarmor', 'pyminifier', 'test', 'tests',
+              'IPython', 'jupyter', 'notebook', 'pip',
+              'PyQt5', 'PyQt6'],
+    noarchive=False,
+    optimize=2,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='LiveStreamFetcher_v{app_version}',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=True,
+    upx=False,
+    console=False,
+    disable_windowed_traceback=True,
+    argv_emulation=False,
+    target_arch=None,
+    icon=r'{project_dir}\app_icon.ico',
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=True,
+    upx=False,
+    upx_exclude=[],
+    name='LiveStreamFetcher_v{app_version}',
+)
+'''
+
+
 def main():
     print("=" * 60)
     print("  LiveStreamFetcher Qt 版防破解打包（PySide6）")
@@ -187,34 +282,68 @@ def main():
     shutil.copy2(os.path.join(PROJECT_DIR, "qt_main.py"), os.path.join(BUILD_DIR, "qt_main.py"))
     print("      已复制 qt_app/ 和 qt_main.py")
 
-    # ── 生成 spec 并打包 ──
-    print("\n[8/8] 生成 spec 并执行 PyInstaller 打包...")
-    spec_content = QT_SPEC_TEMPLATE.format(build_dir=BUILD_DIR, project_dir=PROJECT_DIR, app_version=APP_VERSION)
-    spec_path = os.path.join(BUILD_DIR, "LiveStreamFetcher_qt_protected.spec")
-    with open(spec_path, "w", encoding="utf-8") as f:
-        f.write(spec_content)
-
-    cmd = [PYTHON, "-m", "PyInstaller", "--clean", "--noconfirm", spec_path]
-    print(f"      命令: {' '.join(cmd)}")
+    # ── 生成 spec 并打包（v8.5.0: onefile + onedir 双版本）──
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["CODEBUDDY_SAFE_DELETE_ENABLED"] = "0"
-    result = subprocess.run(cmd, cwd=BUILD_DIR, env=env)
 
+    def _run_pyinstaller(spec_text: str, spec_name: str, tag: str) -> bool:
+        spec_path = os.path.join(BUILD_DIR, spec_name)
+        with open(spec_path, "w", encoding="utf-8") as f:
+            f.write(spec_text)
+        cmd = [PYTHON, "-m", "PyInstaller", "--clean", "--noconfirm", spec_path]
+        print(f"\n[8/9] 执行 {tag} 打包...")
+        print(f"      命令: {' '.join(cmd)}")
+        return subprocess.run(cmd, cwd=BUILD_DIR, env=env).returncode == 0
+
+    # ── 1) onefile（单文件版，传统分发渠道）──
+    onefile_ok = _run_pyinstaller(
+        QT_SPEC_TEMPLATE.format(build_dir=BUILD_DIR, project_dir=PROJECT_DIR, app_version=APP_VERSION),
+        "LiveStreamFetcher_qt_protected.spec",
+        "onefile（单文件版）",
+    )
+
+    # ── 2) onedir（文件夹版，零 C 盘解压）──
+    onedir_ok = _run_pyinstaller(
+        QT_SPEC_TEMPLATE_ONEDIR.format(build_dir=BUILD_DIR, project_dir=PROJECT_DIR, app_version=APP_VERSION),
+        "LiveStreamFetcher_qt_protected_onedir.spec",
+        "onedir（文件夹版）",
+    )
+
+    print("\n[9/9] 收集产物...")
+    success = False
+
+    # onefile 产物 → dist\LiveStreamFetcher_v{ver}.exe
     output_exe = os.path.join(BUILD_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}.exe")
-    if os.path.exists(output_exe):
+    if onefile_ok and os.path.exists(output_exe):
         size_mb = os.path.getsize(output_exe) / (1024 * 1024)
-        print(f"\n  打包成功: {output_exe} ({size_mb:.1f} MB)")
+        print(f"\n  onefile 打包成功: {output_exe} ({size_mb:.1f} MB)")
         project_dist = os.path.join(PROJECT_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}.exe")
         if os.path.exists(project_dist):
             os.remove(project_dist)
         shutil.copy2(output_exe, project_dist)
         print(f"  已复制到: {project_dist}")
-        print("\n  防护层级: 核心函数混淆 + 文档清理 + 反调试 + 完整性校验 + UPX + 符号剥离")
-        return True
+        success = True
+    else:
+        print("\n  onefile 打包失败！")
 
-    print("\n  打包失败！")
-    return False
+    # onedir 产物 → dist\LiveStreamFetcher_v{ver}_onedir.zip
+    onedir_folder = os.path.join(BUILD_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}")
+    if onedir_ok and os.path.isdir(onedir_folder):
+        zip_base = os.path.join(PROJECT_DIR, "dist", f"LiveStreamFetcher_v{APP_VERSION}_onedir")
+        if os.path.exists(zip_base + ".zip"):
+            os.remove(zip_base + ".zip")
+        # zip 内顶层带版本文件夹，用户解压即用
+        zip_path = shutil.make_archive(zip_base, "zip", root_dir=os.path.dirname(onedir_folder), base_dir=os.path.basename(onedir_folder))
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        print(f"\n  onedir 打包成功: {zip_path} ({size_mb:.1f} MB)")
+        success = True
+    else:
+        print("\n  onedir 打包失败！")
+
+    if success:
+        print("\n  防护层级: 核心函数混淆 + 文档清理 + 反调试 + 完整性校验 + UPX(onefile) + 符号剥离")
+    return success
 
 
 if __name__ == "__main__":
