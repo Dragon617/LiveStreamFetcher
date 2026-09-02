@@ -4243,6 +4243,86 @@ def _get_app_cache_dir(subdir: str = "") -> str:
     return target
 
 
+# v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
+def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
+    """多次轮询 taskkill /IM chrome.exe，直到 tasklist 报告 0 个 chrome.exe 残留。
+
+    atexit 阶段：PyInstaller 即将清理 _MEIPASS 临时目录，需要所有
+    Chromium 子进程（主/渲染/GPU/utility）完全退出，文件锁才会释放。
+    Playwright 同步关闭是优雅的（发送 close 信号），但 Chromium 子进程
+    退出是异步的，单次 taskkill + 1.5s sleep 不够。
+    """
+    import time as _time
+    if sys.platform != "win32":
+        return
+
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    def _count_chrome() -> int:
+        """用 tasklist 计数残留 chrome.exe 进程数。"""
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, creationflags=NO_WINDOW,
+            )
+            # tasklist 输出为空或"INFO: No tasks..." 都表示 0 进程
+            out = (r.stdout or "").strip()
+            if not out or "INFO: No tasks" in out:
+                return 0
+            # 每行一条记录，去掉空行
+            lines = [ln for ln in out.splitlines() if ln.strip()]
+            return len(lines)
+        except Exception:
+            return -1   # 查询失败不知道有多少，按"还有残留"处理
+
+    for round_idx in range(max_rounds):
+        # 1. 强制 taskkill
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                capture_output=True, timeout=10, creationflags=NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+        # 2. 立即计数（taskkill 后大部分已退出）
+        after_kill = _count_chrome()
+        if after_kill == 0:
+            return  # 完全干净
+
+        # 3. 等待 1.5 秒再检测
+        _time.sleep(1.5)
+        after_wait = _count_chrome()
+        if after_wait == 0:
+            return  # 第二轮等待就清干净了
+
+    # 4. 兜底：再 taskkill 一次（即使检测还说有，不影响 _MEIPASS 释放）
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            capture_output=True, timeout=5, creationflags=NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
+# v8.4.8: Playwright watcher 守护线程管理（防止 p.stop() 卡 atexit）
+_PLAYWRIGHT_WATCHER = {"p_list": [], "timer": None}
+
+
+def _register_playwright_watcher(p) -> None:
+    """注册一个 watcher 在心跳丢失时主动 reload/context close，防止 Playwright
+    内部连接线程异常僵死导致 p.stop() 阻塞。
+    """
+    _PLAYWRIGHT_WATCHER["p_list"].append(p)
+
+
+def _disable_playwright_watcher() -> None:
+    """清理 watcher。atexit 阶段禁用避免 join 自身卡。"""
+    _PLAYWRIGHT_WATCHER["p_list"].clear()
+
+
 def _cleanup_all_playwright_contexts():
     """EXE 退出时统一关闭所有 Playwright 浏览器 context（含 Chromium 子进程）。
 
@@ -4255,8 +4335,19 @@ def _cleanup_all_playwright_contexts():
     v8.3.6: 强制 taskkill chrome.exe 释放 _MEIPASS 临时目录锁
     v8.3.7: 优先用 session 里的 chrome_proc 句柄优雅 terminate，taskkill 兜底
     v8.3.8: 处理 _SHARED_BROWSER_SESSION 单例（共用 chrome.exe）
+    v8.4.4: 改用 launch_persistent_context 后 chrome_proc 永远是 None → 不再依赖句柄
+    v8.4.8: atexit 钩子升级——多次 taskkill 等待循环（最多 3 轮，每轮检测进程数，
+             等 0 才退出），彻底杀尽所有 Chromium 子进程，确保 _MEIPASS 文件锁释放。
+             同时清掉 watcher 守护线程，避免 join 自身卡 atexit。
     """
-    # 1. 优雅关闭 Playwright
+    # 0. 先取消 watcher 守护线程（如果存在）—— 避免 p.stop() 阻塞时 watcher 干扰
+    try:
+        from live_stream_fetcher import _disable_playwright_watcher
+        _disable_playwright_watcher()
+    except Exception:
+        pass
+
+    # 1. 优雅关闭所有 Playwright contexts
     for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
             _, ctx_or_browser = entry
@@ -4267,6 +4358,19 @@ def _cleanup_all_playwright_contexts():
                     ctx_or_browser.close()
         except Exception:
             pass
+
+    # 2. 优雅关闭共享 session（v8.4.4: launch_persistent_context 的 context）
+    if _SHARED_BROWSER_SESSION is not None:
+        try:
+            _, context, _, _ = _SHARED_BROWSER_SESSION
+            if context is not None and hasattr(context, 'close'):
+                context.close()
+        except Exception:
+            pass
+        _SHARED_BROWSER_SESSION = None
+
+    # 3. 停止所有 Playwright drivers
+    for entry in list(_PLATFORM_BROWSER_RUNNERS):
         try:
             p, _ = entry
             if p is not None:
@@ -4274,37 +4378,13 @@ def _cleanup_all_playwright_contexts():
         except Exception:
             pass
     _PLATFORM_BROWSER_RUNNERS.clear()
+    _PLATFORM_BROWSER_SESSIONS.clear()
 
-    # 2. v8.3.8: 优雅关闭共享 chrome.exe
-    if _SHARED_BROWSER_SESSION is not None:
-        try:
-            _, _, chrome_proc, _ = _SHARED_BROWSER_SESSION
-            if chrome_proc and chrome_proc.poll() is None:
-                chrome_proc.terminate()
-        except Exception:
-            pass
-        # 兼容 v8.3.7 旧的多 session 残留
-        for platform_key, sess in list(_PLATFORM_BROWSER_SESSIONS.items()):
-            try:
-                _, _, chrome_proc = sess
-                if chrome_proc and chrome_proc.poll() is None:
-                    chrome_proc.terminate()
-            except Exception:
-                pass
-        _PLATFORM_BROWSER_SESSIONS.clear()
-
-    # 3. 强制 taskkill 残留 chrome.exe（关键：释放 _MEIPASS 临时目录锁）
-    import time as _time
-    _time.sleep(1.5)
+    # 4. v8.4.8 关键：激进 taskkill 循环杀 Chromium 子进程
+    #    atexit 阶段 PyInstaller 即将清理 _MEI 临时目录，必须等所有
+    #    Chromium 子进程完全释放文件锁。多次 taskkill + 等待直到稳定 0 进程。
     if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
-                capture_output=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
+        _aggressive_kill_chrome()
 
 
 import atexit
@@ -4347,12 +4427,14 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
         return False, f"不支持的平台: {platform_key}"
 
     # v8.4.4: 复用 session：用 BrowserContext.new_page() 创建新 tab + goto
-    # v8.4.7: goto 失败时清掉 _SHARED_BROWSER_SESSION（让下次重启 chrome），
-    #   避免复用已损坏的 context 导致"Target page, context or browser has been closed"。
+    # v8.4.8: 修复"Target page, context or browser has been closed"
+    #   - context.new_page() 后必须 wait_for_load_state 等初始 about:blank 加载完成
+    #     （Playwright 内部要 200-500ms 注册新 page，否则立即 goto 会报"page closed"）
+    #   - goto 失败**不再**清 _SHARED_BROWSER_SESSION，只在 context 探测失败时清
     if _SHARED_BROWSER_SESSION is not None:
         try:
             _, context, _, _ = _SHARED_BROWSER_SESSION
-            # 先探测 context 健康（防止 chrome 进程已死但 session 还指向它）
+            # 探测 context 健康（防止 chrome 进程已死但 session 还指向它）
             try:
                 _ = context.pages
             except Exception as probe_err:
@@ -4363,19 +4445,27 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
             if _SHARED_BROWSER_SESSION is not None:
                 page = context.new_page()
                 page.set_default_navigation_timeout(20000)
+                # v8.4.8: 关键——等初始 about:blank 加载完成，给 Playwright 时间
+                # 在 server 端注册新 page。否则立即 goto 会因 page 还未注册
+                # 而抛"Target page, context or browser has been closed"。
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass  # about:blank 太快时直接返回
                 try:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
                 except Exception as e1:
                     try:
+                        # v8.4.8: 第二次尝试用 commit 模式（不等待 server 响应）
                         page.goto(target_url, wait_until="commit", timeout=15000)
                     except Exception as e2:
+                        # 失败不再清 session（避免雪崩），只关闭这一个失败 page
                         try:
-                            page.close()
+                            if not page.is_closed():
+                                page.close()
                         except Exception:
                             pass
-                        # v8.4.7: 清掉坏 session，下次重启 chrome
-                        _SHARED_BROWSER_SESSION = None
-                        return False, f"goto 失败: domcontentloaded={e1}, commit={e2}"
+                        return False, f"goto 失败: domcontentloaded={str(e1)[:80]}, commit={str(e2)[:80]}"
                 return True, ""
         except Exception as e:
             print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
@@ -4433,19 +4523,24 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
                 timeout=30000,
             )
             # 复用 chrome 启动时的初始 New Tab Page（只有一个 tab）
+            # v8.4.8: launch_persistent_context 刚返回时 initial New Tab Page
+            #   还是 about:blank / chrome://newtab，要等它先稳定再 goto
+            #   否则新 page 注册未完成时 goto 报"Target page closed"
             pages = context.pages
             if pages:
+                initial = pages[0]
+                # 等初始 New Tab Page 完成加载
                 try:
-                    pages[0].goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                except Exception as e1:
-                    try:
-                        pages[0].goto(target_url, wait_until="commit", timeout=15000)
-                    except Exception:
-                        pass
-                try:
-                    pages[0].wait_for_load_state("domcontentloaded", timeout=15000)
+                    initial.wait_for_load_state("domcontentloaded", timeout=10000)
                 except Exception:
                     pass
+                try:
+                    initial.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e1:
+                    try:
+                        initial.goto(target_url, wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass
             _PLATFORM_BROWSER_RUNNERS.append((p, context))
             _SHARED_BROWSER_SESSION = (p, context, None, 0)
             result["ok"] = True
