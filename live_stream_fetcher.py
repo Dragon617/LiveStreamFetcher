@@ -4245,18 +4245,38 @@ def _get_app_cache_dir(subdir: str = "") -> str:
 
 # v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
 def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
-    """多次轮询 taskkill /IM chrome.exe，直到 tasklist 报告 0 个 chrome.exe 残留。
+    """多次轮询 taskkill /IM chrome.exe + node.exe（playwright driver），
+    直到 tasklist 报告 0 个 chrome.exe / playwright 相关 node.exe 残留。
 
     atexit 阶段：PyInstaller 即将清理 _MEIPASS 临时目录，需要所有
-    Chromium 子进程（主/渲染/GPU/utility）完全退出，文件锁才会释放。
-    Playwright 同步关闭是优雅的（发送 close 信号），但 Chromium 子进程
-    退出是异步的，单次 taskkill + 1.5s sleep 不够。
+    子进程完全退出，文件锁才会释放：
+    - chrome.exe（主/渲染/GPU/utility）：通过 executable_path 指向 EXE 同目录
+      的 embedded_chromium，**不在 _MEI 里**，但会加载 playwright 注入脚本
+    - node.exe（Playwright driver）：在 _MEI/playwright/driver/package/ 里运行，
+      **直接持有 _MEI 临时目录文件锁**——这是"Failed to remove temporary
+      directory"警告的真正元凶（v8.4.9 才定位到）
     """
     import time as _time
     if sys.platform != "win32":
         return
 
     NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    def _kill_playwright_node() -> None:
+        """精确杀掉 playwright 相关的 node.exe（通过 CommandLine 含 playwright 筛选，
+        避免误杀用户的其它 node 进程）。"""
+        try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*playwright*' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, timeout=15, creationflags=NO_WINDOW,
+            )
+        except Exception:
+            pass
 
     def _count_chrome() -> int:
         """用 tasklist 计数残留 chrome.exe 进程数。"""
@@ -4266,18 +4286,19 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=10, creationflags=NO_WINDOW,
             )
-            # tasklist 输出为空或"INFO: No tasks..." 都表示 0 进程
             out = (r.stdout or "").strip()
             if not out or "INFO: No tasks" in out:
                 return 0
-            # 每行一条记录，去掉空行
             lines = [ln for ln in out.splitlines() if ln.strip()]
             return len(lines)
         except Exception:
-            return -1   # 查询失败不知道有多少，按"还有残留"处理
+            return -1
+
+    # v8.4.9 关键：先杀 playwright driver（node.exe），再杀 chrome.exe
+    _kill_playwright_node()
 
     for round_idx in range(max_rounds):
-        # 1. 强制 taskkill
+        # 1. 强制 taskkill chrome.exe + node.exe
         try:
             subprocess.run(
                 ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
@@ -4285,19 +4306,21 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
             )
         except Exception:
             pass
+        # 每轮都补杀 playwright node（driver 可能重连）
+        _kill_playwright_node()
 
         # 2. 立即计数（taskkill 后大部分已退出）
         after_kill = _count_chrome()
         if after_kill == 0:
-            return  # 完全干净
+            return
 
         # 3. 等待 1.5 秒再检测
         _time.sleep(1.5)
         after_wait = _count_chrome()
         if after_wait == 0:
-            return  # 第二轮等待就清干净了
+            return
 
-    # 4. 兜底：再 taskkill 一次（即使检测还说有，不影响 _MEIPASS 释放）
+    # 4. 兜底：再 taskkill 一次 + 杀 playwright node
     try:
         subprocess.run(
             ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
@@ -4305,6 +4328,7 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
         )
     except Exception:
         pass
+    _kill_playwright_node()
 
 
 # v8.4.8: Playwright watcher 守护线程管理（防止 p.stop() 卡 atexit）
