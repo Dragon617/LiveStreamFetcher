@@ -3,7 +3,8 @@
 
 当前设置项：
   - 浏览器引擎：本软件内置浏览器（Chrome for Testing，推荐）
-               / 电脑自带浏览器（系统 Chrome / Edge）
+               / 电脑自带浏览器（v8.5.3 起 = 系统默认浏览器，
+                 点平台按钮 os.startfile 打开；解析仍用 Chrome/Edge）
 
 配置通过业务层 `_get_browser_engine()` / `_set_browser_engine()` 持久化到
 缓存根目录 settings.json，平台登录浏览器与解析浏览器共用同一引擎。
@@ -145,8 +146,8 @@ class SettingsDialog(QDialog):
             "无需安装任何浏览器，开箱即用，内置完整视频编解码",
         )
         self._card_system = _EngineCard(
-            "电脑自带浏览器（系统 Chrome / Edge）",
-            "调用电脑已安装的 Chrome / Edge 执行登录与解析等全部步骤",
+            "电脑自带浏览器（系统默认浏览器）",
+            "点平台按钮用系统默认浏览器打开；解析直播流仍调用 Chrome / Edge",
         )
         self._card_builtin.clicked.connect(lambda: self._select("builtin"))
         self._card_system.clicked.connect(lambda: self._select("system"))

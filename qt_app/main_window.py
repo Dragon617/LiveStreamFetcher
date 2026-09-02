@@ -406,9 +406,10 @@ class MainWindow(QMainWindow):
             if ok:
                 # v8.5.2: 状态文案按实际引擎显示——v8.5.1 硬编码"已打开内置
                 # 浏览器"，用系统引擎时也这么显示，误导用户以为设置没生效。
+                # v8.5.3: 系统引擎改为调用系统默认浏览器（os.startfile）。
                 try:
                     from live_stream_fetcher import _prefer_system_browser as _psb
-                    _engine_txt = "系统浏览器" if _psb() else "内置浏览器"
+                    _engine_txt = "系统默认浏览器" if _psb() else "内置浏览器"
                 except Exception:
                     _engine_txt = "内置浏览器"
                 self.status_login.setText(f"{meta['short']}直播登录状态：已打开{_engine_txt}")
@@ -471,7 +472,7 @@ class MainWindow(QMainWindow):
         self.status_login.setText(f"{platform}登录状态：解析中...")
 
         # 淘宝/小红书自动启动本地代理
-        if platform in ("淘宝直播", "小红书"):
+        if platform in ("淘宝直播", "小红书", "虎牙"):
             self._start_proxy(streams, platform)
 
     def _on_fetch_error(self, msg: str):

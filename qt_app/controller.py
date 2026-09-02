@@ -127,6 +127,9 @@ class ProxyStartWorker(QThread):
             return any(d in url for d in ("alicdn.com", "tbcdn.cn", "taobaocdn.com"))
         if self.platform == "小红书":
             return "xhscdn.com" in url
+        if self.platform == "虎牙":
+            # v8.5.3: 虎牙 FLV 反盗链断流 → 代理注入 Referer + ffmpeg 自动重连
+            return "huya.com" in url
         return False
 
     def stop_all(self):

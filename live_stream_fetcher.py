@@ -598,6 +598,28 @@ def _ensure_chromium_ready():
     return None
 
 
+def _sanitize_profile_for_launch(user_data_dir: str) -> None:
+    """v8.5.3: 启动前清理会导致 chrome 秒崩（0x80000003 CHECK 失败）的 profile 残留。
+
+    实证根因（2026-09-02 二分定位）：shared_browser_data 被**系统 Chrome**
+    （引擎切换）写入 `Default/Sync Data/LevelDB` 后，Chrome for Testing 143
+    再打开该 profile 会在启动时 CHECK 崩溃立即退出，Playwright 报
+    "Target page, context or browser has been closed"——所有平台按钮全灭。
+    仅删除 `Default/Sync Data` 即可恢复，且不影响平台登录态（Cookies/Login Data
+    在别处）。自动化 profile 不使用 Google 同步，删除无代价。
+    """
+    if not user_data_dir:
+        return
+    try:
+        import shutil
+        sync_data = os.path.join(user_data_dir, "Default", "Sync Data")
+        if os.path.isdir(sync_data):
+            shutil.rmtree(sync_data, ignore_errors=True)
+            print("[ProfileSanitize] 已清理 Default/Sync Data（防 CfT 启动崩溃）")
+    except Exception as e:
+        print(f"[ProfileSanitize] 清理失败（忽略）: {e}")
+
+
 def _force_unlock_chromium_dir(user_data_dir):
     """v8.0.2 强制解锁 Chromium user_data_dir（防 about:blank）。
 
@@ -608,6 +630,7 @@ def _force_unlock_chromium_dir(user_data_dir):
     1. 用 PowerShell 查找占用 user_data_dir 的 chrome.exe 进程并 taskkill
     2. 等 1.5 秒让进程退出
     3. 删除 SingletonLock / SingletonCookie / SingletonSocket 等锁文件
+    4. v8.5.3: 清理 Default/Sync Data（防 CfT 打开系统 Chrome 写过的 profile 秒崩）
     """
     import subprocess
     import time
@@ -615,8 +638,13 @@ def _force_unlock_chromium_dir(user_data_dir):
     if not user_data_dir:
         return
 
+    _sanitize_profile_for_launch(user_data_dir)
+
     abs_dir = os.path.abspath(user_data_dir)
-    ps_path = abs_dir.replace("\\", "\\\\")
+    # v8.5.3 修复：原先 replace("\\", "\\\\") 把路径反斜杠翻倍，PowerShell -like
+    # 中 \\ 是两个字面反斜杠，永远匹配不到 chrome 单反斜杠 CommandLine，
+    # 导致本函数从未真正找到占用进程（实测 double=False single=True）。
+    ps_path = abs_dir
     NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
     try:
@@ -628,6 +656,7 @@ def _force_unlock_chromium_dir(user_data_dir):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=NO_WINDOW,
         )
         pids = []
         for line in (result.stdout or "").splitlines():
@@ -4490,7 +4519,10 @@ def fetch_huya(url: str, proxy: str = "") -> dict:
     # 按"音频轨"全部丢弃，这里直接自建流列表（含 CDN 线路标识）
     _CDN_NAMES = {"tx": "腾讯云", "aldirect": "阿里云", "al": "阿里云",
                   "hs": "华为云", "hw": "华为云", "ws": "网宿", "bd": "百度"}
-    streams = []
+    # v8.5.3: 线路优先级——腾讯云实测最稳（华为云多次断流），
+    # 同清晰度按此顺序展示，引导用户首选稳定线路
+    _CDN_PREFERENCE = {"tx": 0, "aldirect": 1, "al": 1, "hs": 2, "hw": 2}
+    raw_streams = []
     seen = set()
     for fmt in (info or {}).get("formats") or []:
         furl = fmt.get("url", "")
@@ -4502,12 +4534,22 @@ def fetch_huya(url: str, proxy: str = "") -> dict:
         host_key = (m_host.group(1).lower() if m_host else "")
         line = _CDN_NAMES.get(host_key, host_key.upper() or "线路")
         quality = f"{height}p·{line}" if height else line
-        streams.append({
+        # v8.5.3: ratio 参数 = 码率 kbps，同线路同分辨率有多档码率，标注区分
+        m_ratio = re.search(r'[?&]ratio=(\d+)', furl)
+        if m_ratio:
+            quality += f"·{int(m_ratio.group(1)) / 1000:g}M"
+        # v8.5.3: imgplus = 虎牙 AI 画质增强转码流，标注便于用户知情选择
+        if "imgplus" in furl:
+            quality += "·AI增强"
+        raw_streams.append((_CDN_PREFERENCE.get(host_key, 3), {
             "quality": quality,
             "format": (fmt.get("ext") or "").upper() or guess_format(furl),
             "url": furl,
             "source": "yt-dlp虎牙",
-        })
+            "codec": "h264",   # v8.5.3: 实测虎牙 FLV 均为 H.264，代理用 copy 模式
+        }))
+    # 同分辨率内按线路优先级排序（分辨率排序由 _sort_streams 负责）
+    streams = [s for _, s in sorted(raw_streams, key=lambda t: t[0])]
     if not streams and (info or {}).get("url"):
         furl = info["url"]
         streams.append({
@@ -4515,6 +4557,7 @@ def fetch_huya(url: str, proxy: str = "") -> dict:
             "format": (info.get("ext") or "").upper() or guess_format(furl),
             "url": furl,
             "source": "yt-dlp虎牙",
+            "codec": "h264",
         })
     if not streams:
         raise FetchUserError("未获取到虎牙直播流，主播可能未开播")
@@ -4755,26 +4798,64 @@ def _shared_pw_worker_loop(q: _queue.Queue) -> None:
         _cur_dir = None
 
     def _launch_fresh(target_url, data_dir, chrome_exe_path):
-        """全新启动浏览器并导航（在 worker 线程内调用）。"""
+        """全新启动浏览器并导航（在 worker 线程内调用）。
+
+        v8.5.3 崩溃自愈：
+        1. 启动前 _sanitize_profile_for_launch（删 Default/Sync Data，
+           防 CfT 打开系统 Chrome 写过的 profile 时 CHECK 秒崩）
+        2. 仍失败 → 隔离损坏 profile（重命名加时间戳，保留排查）后用
+           全新 profile 重试一次——宁可丢登录态也不让浏览器功能整体瘫痪
+        """
         nonlocal p, context, _cur_exe, _cur_dir
         from playwright.sync_api import sync_playwright
-        p = sync_playwright().start()
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=data_dir,
-            headless=False,
-            executable_path=chrome_exe_path,
-            viewport={"width": 1280, "height": 800},
-            args=[
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-                # v8.5.1: 禁用 Chrome 侧边栏搜索面板——点击页面内容时可能
-                # 误触侧边搜索面板弹出（看起来像"DevTools 自动打开"）
-                "--disable-features=SideSearch",
-            ],
-            ignore_default_args=["--no-sandbox"],
-            timeout=30000,
-        )
+
+        _sanitize_profile_for_launch(data_dir)
+
+        def _do_launch(dir_):
+            nonlocal p, context
+            p = sync_playwright().start()
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=dir_,
+                headless=False,
+                executable_path=chrome_exe_path,
+                viewport={"width": 1280, "height": 800},
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled",
+                    # v8.5.1: 禁用 Chrome 侧边栏搜索面板——点击页面内容时可能
+                    # 误触侧边搜索面板弹出（看起来像"DevTools 自动打开"）
+                    "--disable-features=SideSearch",
+                ],
+                ignore_default_args=["--no-sandbox"],
+                timeout=30000,
+            )
+
+        try:
+            _do_launch(data_dir)
+        except Exception as e_first:
+            # 启动失败：隔离 profile 后用全新目录重试一次
+            print(f"[shared-pw] 浏览器启动失败（{str(e_first)[:80]}），隔离 profile 后重试")
+            try:
+                if p is not None:
+                    try:
+                        p.stop()
+                    except Exception:
+                        pass
+                    p = None
+            except Exception:
+                pass
+            import time as _t, shutil as _sh
+            _quarantine = f"{data_dir}_broken_{_t.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                if os.path.isdir(data_dir):
+                    os.replace(data_dir, _quarantine)
+                    print(f"[shared-pw] 损坏 profile 已隔离到: {_quarantine}")
+            except Exception as e_mv:
+                print(f"[shared-pw] profile 隔离失败（{e_mv}），删除后重试")
+                _sh.rmtree(data_dir, ignore_errors=True)
+            _do_launch(data_dir)  # 全新 profile 最后一次尝试，失败则抛出
+
         _cur_exe = chrome_exe_path
         _cur_dir = data_dir
         # 首次启动：复用初始 New Tab Page，避免双 tab
@@ -5475,11 +5556,17 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
 
     # chrome.exe 路径（v8.5.0: 支持「电脑自带浏览器」设置）
     if _prefer_system_browser():
-        _sys_exe = _find_system_browser_exe()
-        if not _sys_exe:
-            return False, "未找到系统 Chrome/Edge 浏览器，请安装 Chrome 或在设置中改回内置浏览器"
-        browser_path = os.path.dirname(_sys_exe)
-        _chrome_exe_path = _sys_exe
+        # v8.5.3: 「电脑自带浏览器」= 调用系统**默认浏览器**打开平台页面。
+        # 用户明确要求：点平台按钮应打开本机默认浏览器（Shell 关联），
+        # 而不是强制用 Chrome/Edge 新窗口。os.startfile 走 Windows Shell
+        # 打开 http(s) URL，自动落在用户设定的默认浏览器里。
+        # 注意：解析直播流（Playwright 自动化）仍按启动链使用 Chrome/Edge，
+        # 与平台页面浏览互不影响（免登录平台斗鱼/虎牙/YY 尤其如此）。
+        try:
+            os.startfile(target_url)
+            return True, ""
+        except Exception as e_start:
+            return False, f"打开系统默认浏览器失败: {e_start}"
     else:
         browser_path = _ensure_chromium_ready()
         if not browser_path:
@@ -7833,6 +7920,12 @@ class LocalStreamProxy:
             "referer": "https://www.xiaohongshu.com/",
             "origin": "https://www.xiaohongshu.com",
         },
+        "虎牙": {
+            # v8.5.3: 虎牙 FLV 有反盗链风控（连接被掐断 → OBS 卡顿黑屏），
+            # 注入页面 Referer + ffmpeg 自动重连参数对抗断流
+            "referer": "https://www.huya.com/",
+            "origin": "https://www.huya.com",
+        },
         "通用": {
             "referer": "",   # 转码工具手动输入的链接，不注入 Referer
             "origin": "",
@@ -8029,9 +8122,16 @@ class LocalStreamProxy:
             return
 
         # 小红书统一走 ffmpeg（xhscdn.com CDN 兼容性问题 + 鉴权头需求）
+        # v8.5.3: 虎牙也统一走 ffmpeg——反盗链断流需要 ffmpeg 自动重连参数
+        # （requests 转发路径断流即终止，OBS 表现为卡顿黑屏）
         # HEVC 转码模式也统一走 ffmpeg
-        if self._platform == "小红书" or self._codec_hint == "hevc":
-            reason = "小红书平台" if self._platform == "小红书" else "HEVC转码模式"
+        if self._platform in ("小红书", "虎牙") or self._codec_hint == "hevc":
+            if self._platform == "小红书":
+                reason = "小红书平台"
+            elif self._platform == "虎牙":
+                reason = "虎牙平台(自动重连)"
+            else:
+                reason = "HEVC转码模式"
             print(f"[代理] {reason}，统一使用 ffmpeg 拉流...")
             self._serve_via_ffmpeg(client_sock, force_transcode=(self._codec_hint == "hevc"))
             return
@@ -8186,12 +8286,22 @@ class LocalStreamProxy:
                 print(f"[代理-ffmpeg] ffprobe 编码探测失败: {e}，默认转码")
                 need_transcode = True
 
+        # v8.5.3: HTTP 自动重连参数（全平台通用）。
+        # 虎牙 FLV 反盗链会中途掐断连接（OBS 表现：卡顿→黑屏），
+        # ffmpeg 带 reconnect 参数后上游断流自动重连，OBS 端无感恢复。
+        _reconnect_args = [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+
         if need_transcode:
             self._is_hevc = True
             cmd = [
                 ffmpeg_path,
                 "-hide_banner", "-loglevel", "warning",
                 "-headers", custom_headers,
+                *_reconnect_args,
                 "-i", self._target_url,
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
@@ -8209,6 +8319,7 @@ class LocalStreamProxy:
                 ffmpeg_path,
                 "-hide_banner", "-loglevel", "warning",
                 "-headers", custom_headers,
+                *_reconnect_args,
                 "-i", self._target_url,
                 "-c:v", "copy",
                 "-c:a", "copy",
