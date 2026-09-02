@@ -80,6 +80,13 @@ PLATFORM_PATTERNS = {
         r"yy\.com",
         r"mobi\.yy\.com",
     ],
+    "斗鱼": [
+        r"douyu\.com",
+        r"douyutv\.com",
+    ],
+    "虎牙": [
+        r"huya\.com",
+    ],
 }
 
 HEADERS_PC = {
@@ -4125,6 +4132,403 @@ def fetch_yy_live(url: str, proxy: str = "") -> dict:
     }
 
 
+# ═══════════════════════════════════════════════════════
+# 斗鱼直播
+# ═══════════════════════════════════════════════════════
+#
+# 技术背景（v8.5.2 调研结论）：
+# - 斗鱼 PC 页已改为 SPA 空壳，页面无 $ROOM / ub98484234 / __NEXT_DATA__，
+#   yt-dlp 的 DouyuTV extractor 因此失效（Unable to extract room id）。
+# - 流地址接口 getH5Play 带 ub98484234 签名 + WAF 校验，纯 requests
+#   即使签名完全正确也返回 403「鉴权失败」（TLS 指纹/WAF cookie 校验）。
+# - 因此主路径采用 Playwright 真实浏览器：页面自身 JS 完成签名与 WAF，
+#   我们监听 getH5Play API 响应，并按 multirates 重放签名参数换取全清晰度。
+# - 开播状态/真实房间号/标题用 requests 打 m.douyu.com 移动页 SSR 数据
+#   快速预检（页面内含 pageProps JSON 与 ub98484234 签名脚本）。
+
+def _get_douyu_browser_data_dir():
+    """斗鱼浏览器持久化缓存目录（统一 shared_browser_data，见 _get_ks_browser_data_dir）。"""
+    return _get_app_cache_dir("shared_browser_data")
+
+
+def _douyu_extract_room_id(url: str):
+    """从斗鱼 URL 提取房间号（支持靓号数字/字母，topic 页 rid 参数）。"""
+    m = re.search(r'[?&]rid=([A-Za-z0-9]+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'douyu(?:tv)?\.com/([A-Za-z0-9]+)', url)
+    if m and m.group(1).lower() not in ("topic", "api", "lapi", "japi", "client"):
+        return m.group(1)
+    return None
+
+
+def _douyu_probe_room(room_id: str, proxy: str = ""):
+    """requests 打 m.douyu.com 移动页 SSR 数据，快速获取房间信息。
+
+    Returns:
+        dict(real_rid=str, title=str, uploader=str, is_live=bool)
+        请求失败返回 None（调用方继续走浏览器路径）。
+    """
+    try:
+        session = make_requests_session(proxy)
+        resp = session.get(
+            f"https://m.douyu.com/{room_id}",
+            headers=HEADERS_MOBILE, timeout=12,
+        )
+        html = resp.text
+        # pageProps SSR JSON（script 块以 {"pageProps" 开头）
+        for block in re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+            block = block.strip()
+            if not block.startswith('{"pageProps"'):
+                continue
+            try:
+                data = json.loads(block)
+            except json.JSONDecodeError:
+                continue
+            inner = (((data.get("pageProps") or {}).get("room") or {})
+                     .get("roomInfo") or {}).get("roomInfo") or {}
+            if not inner:
+                continue
+            return {
+                "real_rid": str(inner.get("rid") or room_id),
+                "title": inner.get("roomName") or "",
+                "uploader": inner.get("nickname") or "",
+                "is_live": bool(inner.get("isLive")),
+            }
+        # 无 pageProps：至少给出真实 rid
+        m = re.search(r'"rid":\s*(\d+)', html)
+        return {
+            "real_rid": m.group(1) if m else room_id,
+            "title": "", "uploader": "", "is_live": None,
+        }
+    except Exception as e:
+        print(f"[斗鱼] 房间信息预检失败: {e}")
+        return None
+
+
+def _douyu_fetch_via_playwright(room_id: str, probe: dict):
+    """Playwright 浏览器自动化获取斗鱼直播流。
+
+    流程：
+      1. 打开 www.douyu.com/{room_id}，页面 JS 自动完成 ub98484234 签名
+         并请求 getH5Play 接口
+      2. 监听 getH5Play 响应：拿到 rtmp_live_url + multirates 清晰度列表
+         + 请求体（含 v/did/tt/sign 签名参数）
+      3. 用拦截到的签名请求体，按 multirates 逐个改 rate 重放，
+         换取每个清晰度的 rtmp_live_url
+      4. 兜底：网络拦截 .flv/.m3u8 流地址
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[斗鱼 Playwright] playwright 未安装")
+        return None
+
+    real_rid = (probe or {}).get("real_rid") or room_id
+    streams = []
+    title_info = {
+        "title": (probe or {}).get("title") or "",
+        "uploader": (probe or {}).get("uploader") or "",
+    }
+    api_hits = []          # [(api_url, post_data, resp_json)]
+    seen_urls = set()
+
+    def _add_stream(quality, fmt, surl, source):
+        if surl and surl.startswith("http") and surl not in seen_urls:
+            seen_urls.add(surl)
+            streams.append({"quality": quality, "format": fmt,
+                            "url": surl, "source": source})
+
+    try:
+        with sync_playwright() as p:
+            user_data_dir = _get_douyu_browser_data_dir()
+            launch_args = [
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--window-size=1920,1080",
+                "--autoplay-policy=no-user-gesture-required",
+            ]
+            launch_kwargs = {
+                "headless": False,
+                "args": launch_args,
+                "viewport": {"width": 1920, "height": 1080},
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+                "ignore_default_args": ["--enable-automation"],
+                "chromium_sandbox": False,
+                "no_viewport": False,
+            }
+
+            context = None
+            launch_errors = []
+            embedded_chromium = _ensure_chromium_ready()
+            _force_unlock_chromium_dir(user_data_dir)
+            if embedded_chromium:
+                try:
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir,
+                        executable_path=os.path.join(embedded_chromium, "chrome.exe"),
+                        **launch_kwargs,
+                    )
+                except Exception as e_embed:
+                    launch_errors.append(f"Embedded: {e_embed}")
+            if not context:
+                for ch in (_first_fallback_channel(), "chrome", "msedge"):
+                    try:
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir, channel=ch, **launch_kwargs)
+                        break
+                    except Exception as e:
+                        launch_errors.append(f"{ch}: {e}")
+            if not context:
+                print(f"[斗鱼 Playwright] 浏览器启动失败: {'; '.join(launch_errors)}")
+                return None
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+
+            def on_response(response):
+                resp_url = response.url
+                try:
+                    if "getH5Play" in resp_url:
+                        try:
+                            rj = response.json()
+                        except Exception:
+                            rj = None
+                        if rj:
+                            api_hits.append({
+                                "url": resp_url,
+                                "post_data": response.request.post_data or "",
+                                "json": rj,
+                            })
+                    elif any(kw in resp_url.lower() for kw in (".flv", ".m3u8")) and \
+                            any(d in resp_url for d in ("douyucdn", "douyu.com", "douystatic")):
+                        fmt = "M3U8" if ".m3u8" in resp_url.lower() else "FLV"
+                        _add_stream("默认", fmt, resp_url, "网络拦截")
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            print(f"[斗鱼 Playwright] 打开直播间 room_id={room_id} (real={real_rid})...")
+            page.goto(f"https://www.douyu.com/{room_id}",
+                      wait_until="domcontentloaded", timeout=30000)
+
+            # 等待 getH5Play 响应（播放器自动请求），最多 45 秒
+            for wait_i in range(45):
+                if api_hits:
+                    break
+                page.wait_for_timeout(1000)
+                # 15 秒未请求：尝试点击播放区域触发播放器
+                if wait_i == 14:
+                    try:
+                        page.mouse.click(960, 540)
+                        print("[斗鱼 Playwright] 尝试点击页面触发播放...")
+                    except Exception:
+                        pass
+                # 30 秒仍无：刷新一次
+                if wait_i == 29 and not api_hits:
+                    print("[斗鱼 Playwright] 30秒未拦截到接口，刷新页面...")
+                    try:
+                        page.reload()
+                        page.wait_for_timeout(3000)
+                    except Exception:
+                        pass
+
+            # 补充标题（页面标题兜底）
+            if not title_info["title"]:
+                try:
+                    t = page.title() or ""
+                    title_info["title"] = re.sub(r"[-_—]?斗鱼.*$", "", t).strip()
+                except Exception:
+                    pass
+
+            # ── 解析 getH5Play 响应 ──
+            hit = None
+            for h in api_hits:
+                if isinstance(h["json"], dict) and h["json"].get("error") == 0:
+                    hit = h
+                    break
+            if hit is None and api_hits:
+                hit = api_hits[0]  # 非 0 error 也留作诊断
+
+            if hit:
+                rj = hit["json"]
+                err = rj.get("error")
+                print(f"[斗鱼 Playwright] getH5Play error={err} msg={rj.get('msg')}")
+                data = rj.get("data") or {}
+                if err == 0 and data:
+                    # 当前响应的流
+                    base_url = data.get("rtmp_live_url") or ""
+                    if not base_url and data.get("rtmp_url") and data.get("rtmp_live"):
+                        base_url = f"{data['rtmp_url']}/{data['rtmp_live']}"
+                    _add_stream("原画", "FLV", base_url, "getH5Play")
+                    if data.get("hls_url"):
+                        _add_stream("原画", "M3U8", data["hls_url"], "getH5Play")
+
+                    # ── 按 multirates 重放签名参数换取全清晰度 ──
+                    multirates = data.get("multirates") or []
+                    post_body = hit["post_data"]
+                    if multirates and post_body:
+                        try:
+                            from urllib.parse import parse_qsl
+                            form = dict(parse_qsl(post_body))
+                            for mr in multirates:
+                                rate = str(mr.get("rate"))
+                                name = mr.get("name") or f"rate{rate}"
+                                form["rate"] = rate
+                                try:
+                                    api_resp = context.request.post(
+                                        hit["url"], form=form,
+                                        headers={"Referer": page.url},
+                                        timeout=10000,
+                                    )
+                                    rj2 = api_resp.json()
+                                    d2 = (rj2 or {}).get("data") or {}
+                                    u2 = d2.get("rtmp_live_url") or ""
+                                    if not u2 and d2.get("rtmp_url") and d2.get("rtmp_live"):
+                                        u2 = f"{d2['rtmp_url']}/{d2['rtmp_live']}"
+                                    _add_stream(name, "FLV", u2, "getH5Play多码率")
+                                    if d2.get("hls_url"):
+                                        _add_stream(name, "M3U8", d2["hls_url"], "getH5Play多码率")
+                                except Exception as e_rate:
+                                    print(f"[斗鱼 Playwright] rate={rate}({name}) 获取失败: {e_rate}")
+                        except Exception as e_form:
+                            print(f"[斗鱼 Playwright] 多码率重放失败: {e_form}")
+                elif err in (104, 105):
+                    raise FetchUserError("主播未开播或直播间不存在")
+
+            context.close()
+
+    except FetchUserError:
+        raise
+    except Exception as e:
+        print(f"[斗鱼 Playwright] 解析异常: {e}")
+        return None
+
+    if not streams:
+        return None
+    return {
+        "platform": "斗鱼",
+        "title": title_info["title"] or f"斗鱼直播间 {room_id}",
+        "uploader": title_info["uploader"],
+        "is_live": True,
+        "streams": streams,
+        "method": "斗鱼专属解析(Playwright)",
+    }
+
+
+def fetch_douyu(url: str, proxy: str = "") -> dict:
+    """斗鱼直播专属解析
+
+    策略：
+      1. requests 打 m.douyu.com 移动页 SSR 数据 → 真实房间号/标题/开播状态
+      2. 未开播直接报错（不必启动浏览器空等）
+      3. Playwright 打开直播间，监听 getH5Play API + 多码率重放
+    """
+    room_id = _douyu_extract_room_id(url)
+    if not room_id:
+        raise FetchUserError("无法从URL中提取斗鱼房间号，请检查链接格式")
+
+    probe = _douyu_probe_room(room_id, proxy)
+    if probe and probe.get("is_live") is False:
+        raise FetchUserError(
+            f"斗鱼直播间 {room_id} 当前未开播\n\n"
+            f"请确认主播正在直播后再解析"
+        )
+
+    result = _douyu_fetch_via_playwright(room_id, probe)
+    if result and result.get("streams"):
+        return result
+
+    raise FetchUserError(
+        "斗鱼直播解析失败。\n"
+        "可能原因：\n"
+        "  1) 直播间未开始或已结束\n"
+        "  2) 浏览器启动失败或页面加载异常\n"
+        "  3) 斗鱼风控拦截\n\n"
+        "建议：\n"
+        "  - 确认直播间正在直播中\n"
+        "  - 等1-2分钟后重试"
+    )
+
+
+# ═══════════════════════════════════════════════════════
+# 虎牙直播
+# ═══════════════════════════════════════════════════════
+#
+# yt-dlp 内置 huya extractor 可用（2026-08 版本实测 12 路 FLV 格式），
+# 直接走 yt-dlp 主路径，无需浏览器与登录。
+
+def _get_huya_browser_data_dir():
+    """虎牙浏览器持久化缓存目录（统一 shared_browser_data）。"""
+    return _get_app_cache_dir("shared_browser_data")
+
+
+def fetch_huya(url: str, proxy: str = "") -> dict:
+    """虎牙直播专属解析（yt-dlp 主路径）"""
+    try:
+        info = fetch_streams_ytdlp(url, proxy)
+    except FetchUserError:
+        raise
+    except Exception as e:
+        err = str(e)
+        if "offline" in err.lower() or "not live" in err.lower():
+            raise FetchUserError("虎牙主播当前未开播，请确认正在直播后再解析")
+        raise FetchUserError(
+            f"虎牙直播解析失败\n\n"
+            f"原因：{err.replace(chr(10), ' ').strip()[:80]}\n\n"
+            f"建议：\n"
+            f"  1) 确认主播正在直播\n"
+            f"  2) 检查链接是否为虎牙直播间地址\n"
+            f"  3) 等1-2分钟后重试"
+        )
+
+    # 虎牙 formats 无 vcodec 元数据（直播流常见），parse_stream_info 会
+    # 按"音频轨"全部丢弃，这里直接自建流列表（含 CDN 线路标识）
+    _CDN_NAMES = {"tx": "腾讯云", "aldirect": "阿里云", "al": "阿里云",
+                  "hs": "华为云", "hw": "华为云", "ws": "网宿", "bd": "百度"}
+    streams = []
+    seen = set()
+    for fmt in (info or {}).get("formats") or []:
+        furl = fmt.get("url", "")
+        if not furl or furl in seen:
+            continue
+        seen.add(furl)
+        height = fmt.get("height") or 0
+        m_host = re.search(r'https?://([^./]+)', furl)
+        host_key = (m_host.group(1).lower() if m_host else "")
+        line = _CDN_NAMES.get(host_key, host_key.upper() or "线路")
+        quality = f"{height}p·{line}" if height else line
+        streams.append({
+            "quality": quality,
+            "format": (fmt.get("ext") or "").upper() or guess_format(furl),
+            "url": furl,
+            "source": "yt-dlp虎牙",
+        })
+    if not streams and (info or {}).get("url"):
+        furl = info["url"]
+        streams.append({
+            "quality": info.get("resolution", "") or "默认",
+            "format": (info.get("ext") or "").upper() or guess_format(furl),
+            "url": furl,
+            "source": "yt-dlp虎牙",
+        })
+    if not streams:
+        raise FetchUserError("未获取到虎牙直播流，主播可能未开播")
+
+    return {
+        "platform": "虎牙",
+        "title": (info or {}).get("title", "") or "",
+        "uploader": (info or {}).get("uploader", "") or "",
+        "is_live": True,
+        "streams": streams,
+        "method": "虎牙专属解析(yt-dlp)",
+    }
+
+
 def _set_system_proxy(port: int) -> str:
     """设置 Windows 系统代理"""
     import winreg
@@ -4224,6 +4628,8 @@ PLATFORM_FETCHERS = {
     "小红书": fetch_xiaohongshu,
     "淘宝直播": fetch_taobao_live,
     "YY直播": fetch_yy_live,
+    "斗鱼": fetch_douyu,
+    "虎牙": fetch_huya,
 }
 
 
@@ -5037,6 +5443,8 @@ _PLATFORM_BROWSER_MAP = {
     "xhs": (_get_xhs_browser_data_dir, _check_xhs_login_status),
     "tb": (_get_tb_browser_data_dir, _check_tb_login_status),
     "yy": (_get_yy_browser_data_dir, None),
+    "douyu": (_get_douyu_browser_data_dir, None),
+    "huya": (_get_huya_browser_data_dir, None),
 }
 
 
@@ -5300,9 +5708,13 @@ def _tag_streams_with_quality(streams: list) -> list:
 
 
 def _dedup_streams(streams: list) -> list:
+    # v8.5.2: 去重键追加 quality 标签。
+    # 虎牙同一 CDN 主干的 480p/720p/1080p 仅有 query 的 ratio 参数不同，
+    # 纯按 base URL 去重会把多清晰度坍缩成一路；加上 quality 后各清晰度保留。
+    # 对其他平台无影响：同一流的不同签名变体 base URL + quality 均相同，仍去重。
     seen = {}
     for s in streams:
-        key = s["url"].split("?")[0]
+        key = s["url"].split("?")[0] + "|" + (s.get("quality") or "")
         if key not in seen:
             seen[key] = s
     return list(seen.values())

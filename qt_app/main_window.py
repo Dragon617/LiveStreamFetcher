@@ -404,7 +404,14 @@ class MainWindow(QMainWindow):
             # 但这里我们额外把 new_page + goto 放进 daemon thread，避免阻塞主线程
             ok, err = _open_platform_in_chromium(key, target_url)
             if ok:
-                self.status_login.setText(f"{meta['short']}直播登录状态：已打开内置浏览器")
+                # v8.5.2: 状态文案按实际引擎显示——v8.5.1 硬编码"已打开内置
+                # 浏览器"，用系统引擎时也这么显示，误导用户以为设置没生效。
+                try:
+                    from live_stream_fetcher import _prefer_system_browser as _psb
+                    _engine_txt = "系统浏览器" if _psb() else "内置浏览器"
+                except Exception:
+                    _engine_txt = "内置浏览器"
+                self.status_login.setText(f"{meta['short']}直播登录状态：已打开{_engine_txt}")
             else:
                 self.status_login.setText(f"{meta['short']}直播登录状态：浏览器启动失败 - {err}")
         except Exception as e:

@@ -95,6 +95,8 @@ class Colors:
     PLATFORM_TAOBAO = "#FF6A00"
     PLATFORM_YY = "#FFD700"
     PLATFORM_WECHAT = "#07C160"
+    PLATFORM_DOUYU = "#FF5D23"
+    PLATFORM_HUYA = "#FFB300"
 
     # ── 状态色 ──
     STATUS_ONLINE = "#10b981"
@@ -144,6 +146,22 @@ PLATFORM_META = {
         "open_url": "https://www.yy.com/i/index/anchor",
         "color": Colors.PLATFORM_YY,
         "desc": "支持 www.yy.com / wap.yy.com 多端解析",
+        "login": False,
+    },
+    "douyu": {
+        "name": "斗鱼直播", "short": "斗鱼", "icon": "🦈",
+        "icon_path": "icons/douyu_real.png",
+        "open_url": "https://www.douyu.com/",
+        "color": Colors.PLATFORM_DOUYU,
+        "desc": "支持 www.douyu.com 房间号解析 · 免登录",
+        "login": False,
+    },
+    "huya": {
+        "name": "虎牙直播", "short": "虎牙", "icon": "🐯",
+        "icon_path": "icons/huya_real.png",
+        "open_url": "https://www.huya.com/",
+        "color": Colors.PLATFORM_HUYA,
+        "desc": "支持 www.huya.com 房间号解析 · 免登录",
         "login": False,
     },
 }

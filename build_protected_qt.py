@@ -57,6 +57,8 @@ datas = [
     (r'{project_dir}\icons\tb_real.png', 'icons'),
     (r'{project_dir}\icons\xhs_real.png', 'icons'),
     (r'{project_dir}\icons\yy_real.png', 'icons'),
+    (r'{project_dir}\icons\douyu_real.png', 'icons'),
+    (r'{project_dir}\icons\huya_real.png', 'icons'),
     # v8.3.7: 软件主 logo（标题栏 + 窗口图标）
     (r'{project_dir}\icons\logo_main.png', 'icons'),
     # v8.3.7: 完整 app_icon.ico（EXE 资源图标 + 任务栏图标，多尺寸 256/128/64/48/32/16）
@@ -152,6 +154,8 @@ datas = [
     (r'{project_dir}\icons\tb_real.png', 'icons'),
     (r'{project_dir}\icons\xhs_real.png', 'icons'),
     (r'{project_dir}\icons\yy_real.png', 'icons'),
+    (r'{project_dir}\icons\douyu_real.png', 'icons'),
+    (r'{project_dir}\icons\huya_real.png', 'icons'),
     (r'{project_dir}\icons\logo_main.png', 'icons'),
     (r'{project_dir}\app_icon.ico', '.'),
     (r'{project_dir}\vendor\chrome-win64', 'embedded_chromium'),
