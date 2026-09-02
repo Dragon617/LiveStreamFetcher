@@ -461,7 +461,9 @@ class MainWindow(QMainWindow):
     def _on_fetch_error(self, msg: str):
         self._show_placeholder()
         self.platform_info_label.setText("解析失败")
-        QMessageBox.critical(self, "解析失败", msg)
+        # v8.4.12: 兜底截断超长错误信息（业务层已精简，这里防意外路径）
+        display_msg = msg if len(msg) <= 400 else msg[:400] + "\n……（详情见日志）"
+        QMessageBox.critical(self, "解析失败", display_msg)
 
     def _on_fetch_finished(self):
         self._fetch_worker = None

@@ -264,8 +264,11 @@ def _get_ks_browser_data_dir():
 
     v8.3.7: 优先放 EXE 同目录 cache/LiveStreamFetcher/kuaishou_browser_data/
     不可写时回退 %APPDATA%/LiveStreamFetcher/kuaishou_browser_data/
+    v8.4.12: 统一到 shared_browser_data（所有平台共用一个 Chrome Profile，
+    Chrome 按域名隔离 cookie）。之前平台按钮浏览器写 shared_browser_data、
+    fetch 读 kuaishou_browser_data，cookie 不在同一目录 → 登录后解析仍要登录。
     """
-    return _get_app_cache_dir("kuaishou_browser_data")
+    return _get_app_cache_dir("shared_browser_data")
 
 
 def _check_ks_login_status():
@@ -1432,8 +1435,9 @@ def _get_dy_browser_data_dir():
 
     v8.3.7: 优先放 EXE 同目录 cache/LiveStreamFetcher/douyin_browser_data/
     不可写时回退 %APPDATA%/LiveStreamFetcher/douyin_browser_data/
+    v8.4.12: 统一到 shared_browser_data（原因见 _get_ks_browser_data_dir）。
     """
-    return _get_app_cache_dir("douyin_browser_data")
+    return _get_app_cache_dir("shared_browser_data")
 
 
 def _check_dy_login_status():
@@ -2181,8 +2185,9 @@ def _get_xhs_browser_data_dir():
     """获取小红书浏览器持久化缓存目录（cookie / session / localStorage）
 
     v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/xiaohongshu_browser_data/
+    v8.4.12: 统一到 shared_browser_data（原因见 _get_ks_browser_data_dir）。
     """
-    return _get_app_cache_dir("xiaohongshu_browser_data")
+    return _get_app_cache_dir("shared_browser_data")
 
 
 def _check_xhs_login_status():
@@ -3032,8 +3037,9 @@ def _get_tb_browser_data_dir():
     """获取淘宝浏览器持久化缓存目录
 
     v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/taobao_browser_data/
+    v8.4.12: 统一到 shared_browser_data（原因见 _get_ks_browser_data_dir）。
     """
-    return _get_app_cache_dir("taobao_browser_data")
+    return _get_app_cache_dir("shared_browser_data")
 
 
 def _tb_extract_live_id(url: str) -> str:
@@ -3558,8 +3564,9 @@ def _get_yy_browser_data_dir():
     """获取YY浏览器持久化缓存目录
 
     v8.3.7: 优先 EXE 同目录 cache/LiveStreamFetcher/yy_browser_data/
+    v8.4.12: 统一到 shared_browser_data（原因见 _get_ks_browser_data_dir）。
     """
-    return _get_app_cache_dir("yy_browser_data")
+    return _get_app_cache_dir("shared_browser_data")
 
 
 def _yy_extract_room_id(url: str):
@@ -4184,12 +4191,233 @@ _PLATFORM_BROWSER_RUNNERS = []
 _PLATFORM_BROWSER_SESSIONS = {}   # 保留占位但不再使用（兼容旧调用）
 
 # v8.3.8: 单浏览器进程单例
-_SHARED_BROWSER_SESSION = None   # (p, context, None, 0)
+# v8.4.12: 不再直接持有 p/context —— 由 _SHARED_PW worker 线程独占持有。
+#   保留此全局变量仅作"session 是否活跃"的标志位（True/False），
+#   兼容 extract_streams 等旧代码的 `is not None` 判断。
+_SHARED_BROWSER_SESSION = None   # (p, context, None, 0) —— v8.4.12 起仅作活跃标志
 
 
 # v8.3.7: 给每个平台分配固定 CDP 调试端口（v8.3.8 不再使用，保留兼容）
 # v8.3.8: 单 chrome.exe + 单端口 9222（所有平台共用）
 _CDP_PORT_SHARED = 9222
+
+
+# ═══════════════════════════════════════════════════════
+# v8.4.12: Playwright 单线程 worker —— 解决 sync API 非线程安全
+#
+# 根因：Playwright sync API 的所有对象（p/context/page）绑定到创建它们的
+# 线程（greenlet）。v8.4.11 之前在 daemon thread A 里 start()，又在
+# daemon thread B 里复用同一个 context.new_page() —— 跨线程使用导致
+# "Target page, context or browser has been closed" + about:blank 累积。
+#
+# 方案：唯一的长期 worker 线程独占持有 p/context，其它线程通过队列发命令
+# （open / close / shutdown），worker 串行执行。所有 Playwright 调用
+# 都发生在同一线程，彻底满足 sync API 线程约束。
+# ═══════════════════════════════════════════════════════
+import queue as _queue
+
+_SHARED_PW = {
+    "thread": None,     # worker 线程对象
+    "queue": None,      # _queue.Queue，命令队列
+    "lock": threading.Lock(),
+}
+
+
+def _ensure_shared_pw_worker() -> _queue.Queue:
+    """确保共享浏览器 worker 线程已启动，返回命令队列。"""
+    with _SHARED_PW["lock"]:
+        t = _SHARED_PW["thread"]
+        if t is not None and t.is_alive() and _SHARED_PW["queue"] is not None:
+            return _SHARED_PW["queue"]
+        q = _queue.Queue()
+        _SHARED_PW["queue"] = q
+        t = threading.Thread(
+            target=_shared_pw_worker_loop, args=(q,),
+            daemon=True, name="SharedPWWorker",
+        )
+        _SHARED_PW["thread"] = t
+        t.start()
+        return q
+
+
+def _shared_pw_worker_loop(q: _queue.Queue) -> None:
+    """共享浏览器 Playwright owner 线程：所有 p/context 操作只在此线程执行。
+
+    命令协议：q.put((cmd, payload, result_dict, done_event))
+      - "open":     payload=(target_url, data_dir, chrome_exe_path)
+                    启动（或复用）浏览器并导航到 target_url
+      - "close":    关闭 context + 停止 driver（释放 SingletonLock）
+      - "shutdown": 同 close，但执行后退出线程
+    """
+    p = None
+    context = None
+
+    def _teardown():
+        nonlocal p, context
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if p is not None:
+                p.stop()
+        except Exception:
+            pass
+        p = None
+        context = None
+
+    while True:
+        try:
+            item = q.get()
+        except Exception:
+            break
+        if item is None:  # poison pill
+            break
+        cmd, payload, result, ev = item
+        try:
+            if cmd == "open":
+                target_url, data_dir, chrome_exe_path = payload
+                # 1. 探测现有 context 健康（用户可能手动关了浏览器窗口）
+                if context is not None:
+                    try:
+                        _ = context.pages
+                    except Exception:
+                        _teardown()
+                # 2. 无 context → 全新启动
+                if context is None:
+                    from playwright.sync_api import sync_playwright
+                    p = sync_playwright().start()
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir=data_dir,
+                        headless=False,
+                        executable_path=chrome_exe_path,
+                        viewport={"width": 1280, "height": 800},
+                        args=[
+                            "--no-first-run",
+                            "--no-default-browser-check",
+                            "--disable-blink-features=AutomationControlled",
+                        ],
+                        ignore_default_args=["--no-sandbox"],
+                        timeout=30000,
+                    )
+                    # 首次启动：复用初始 New Tab Page，避免双 tab
+                    pages = context.pages
+                    if pages:
+                        initial = pages[0]
+                        try:
+                            initial.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                        try:
+                            initial.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                        except Exception:
+                            try:
+                                initial.goto(target_url, wait_until="commit", timeout=15000)
+                            except Exception:
+                                pass
+                        result["ok"] = True
+                        result["error"] = ""
+                        ev.set()
+                        continue
+                # 3. 复用：清理 about:blank 残留 page（goto 失败时 Chrome 端 tab 残留）
+                try:
+                    for old_page in list(context.pages):
+                        try:
+                            url = old_page.url if not old_page.is_closed() else ""
+                            if url and url in ("about:blank", "chrome://newtab/", "chrome://newtab"):
+                                try:
+                                    old_page.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # 4. 开新 tab 并导航
+                page = context.new_page()
+                page.set_default_navigation_timeout(20000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass  # about:blank 加载快，超时无碍
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e1:
+                    try:
+                        page.goto(target_url, wait_until="commit", timeout=15000)
+                    except Exception as e2:
+                        try:
+                            if not page.is_closed():
+                                page.close()
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            f"goto 失败: {str(e1)[:60]} / {str(e2)[:60]}"
+                        )
+                result["ok"] = True
+                result["error"] = ""
+            elif cmd in ("close", "shutdown"):
+                _teardown()
+                result["ok"] = True
+                result["error"] = ""
+        except Exception as e:
+            # open 失败时 teardown，避免残留半死的 context
+            if cmd == "open":
+                _teardown()
+            result["ok"] = False
+            result["error"] = str(e)[:200]
+        ev.set()
+        if cmd == "shutdown":
+            break
+    # 线程退出前兜底清理
+    _teardown()
+
+
+def _shared_pw_command(cmd: str, payload=None, timeout: float = 40.0) -> tuple:
+    """向共享浏览器 worker 发送命令并同步等待结果。
+
+    Returns:
+        (ok: bool, error_msg: str)
+    """
+    q = _ensure_shared_pw_worker()
+    result = {"ok": False, "error": "未执行"}
+    ev = threading.Event()
+    q.put((cmd, payload, result, ev))
+    if ev.wait(timeout=timeout):
+        return result["ok"], result["error"]
+    return False, f"worker 命令超时: {cmd}"
+
+
+def _wait_singleton_lock_released(data_dir: str, timeout: float = 6.0) -> bool:
+    """轮询等待 Chrome SingletonLock 文件可删除（即锁已释放）。
+
+    context.close() 返回不代表 chrome.exe 已完全退出，文件锁可能还持有
+    几百毫秒到几秒。fetch 启动新 chrome 前必须确认锁真正释放，
+    否则新进程会 fallback 到临时空 Profile（cookie 丢失）。
+
+    Returns:
+        True = 锁已释放；False = 超时仍被占用
+    """
+    import time as _time
+    deadline = _time.time() + timeout
+    lock_files = [
+        os.path.join(data_dir, "SingletonLock"),
+        os.path.join(data_dir, "SingletonSocket"),
+        os.path.join(data_dir, "SingletonCookie"),
+    ]
+    while _time.time() < deadline:
+        all_gone = True
+        for lf in lock_files:
+            if os.path.exists(lf):
+                try:
+                    os.remove(lf)
+                except OSError:
+                    all_gone = False  # 文件被占用 → 锁未释放
+        if all_gone:
+            return True
+        _time.sleep(0.3)
+    return False
 
 
 def _close_shared_browser_for_fetch(reason: str = "parse"):
@@ -4202,44 +4430,44 @@ def _close_shared_browser_for_fetch(reason: str = "parse"):
     解决方案：解析前主动关闭内置浏览器（释放 SingletonLock），让 fetch_xxx
     启动新 chrome 时能从 shared_browser_data 读到 cookie（已登录态）。
 
+    v8.4.12:
+      - 通过 worker 线程执行 close（满足 sync API 线程约束）
+      - 关闭后轮询等待 SingletonLock 真正释放（最多 6 秒），不再固定 sleep 1.5s
+      - 兜底精确清理 shared_browser_data  profile 的 chrome 进程（不误伤用户 Chrome）
+
     Args:
         reason: "parse"（解析）/ "fetch"（业务流）—— 用于日志
     """
     global _SHARED_BROWSER_SESSION
     if _SHARED_BROWSER_SESSION is None:
         return False
+    # 1. 通过 worker 关闭 context + 停止 driver
     try:
-        _, context, _, _ = _SHARED_BROWSER_SESSION
-        # 优雅关闭所有 page
-        try:
-            for p in list(context.pages):
-                try:
-                    if not p.is_closed():
-                        p.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # 关闭 context（会触发 driver 关闭 chrome.exe）
-        try:
-            context.close()
-        except Exception:
-            pass
-    except Exception:
-        pass
-    # 停止 Playwright driver
-    try:
-        # 注意：(p, context, ...) 结构
-        if _SHARED_BROWSER_SESSION is not None:
-            p = _SHARED_BROWSER_SESSION[0]
-            if p is not None:
-                p.stop()
-    except Exception:
-        pass
+        _shared_pw_command("close", timeout=15.0)
+    except Exception as e:
+        print(f"[close-shared] worker close 异常: {e}")
     _SHARED_BROWSER_SESSION = None
-    # 等待 chrome.exe 完全退出（释放 SingletonLock 文件锁）
-    import time as _time
-    _time.sleep(1.5)
+    # 2. 轮询等待 SingletonLock 文件锁真正释放
+    data_dir = _get_app_cache_dir("shared_browser_data")
+    released = _wait_singleton_lock_released(data_dir, timeout=6.0)
+    if not released:
+        # 3. 兜底：精确杀使用 shared_browser_data profile 的 chrome 进程
+        #    （按 CommandLine 过滤，不误伤用户自己的 Chrome 浏览器）
+        try:
+            ps_cmd = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*shared_browser_data*' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+            NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, timeout=15, creationflags=NO_WINDOW,
+            )
+            _wait_singleton_lock_released(data_dir, timeout=3.0)
+        except Exception:
+            pass
+    print(f"[close-shared] reason={reason}, lock_released={released}")
     return True
 
 
@@ -4345,6 +4573,27 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
         except Exception:
             return -1
 
+    def _count_playwright_node() -> int:
+        """计数 playwright driver 相关的 node.exe 进程数（按 CommandLine 过滤）。
+
+        v8.4.12: node.exe 持有 _MEI 临时目录文件锁，是 "Failed to remove
+        temporary directory" 的元凶。光杀不等没用——必须确认进程真正退出。
+        """
+        try:
+            ps_cmd = (
+                "(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*playwright*' }).Count"
+            )
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, creationflags=NO_WINDOW,
+            )
+            out = (r.stdout or "").strip()
+            return int(out) if out.isdigit() else -1
+        except Exception:
+            return -1
+
     # v8.4.9 关键：先杀 playwright driver（node.exe），再杀 chrome.exe
     _kill_playwright_node()
 
@@ -4363,13 +4612,13 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
         # 2. 立即计数（taskkill 后大部分已退出）
         after_kill = _count_chrome()
         if after_kill == 0:
-            return
+            break
 
         # 3. 等待 1.5 秒再检测
         _time.sleep(1.5)
         after_wait = _count_chrome()
         if after_wait == 0:
-            return
+            break
 
     # 4. 兜底：再 taskkill 一次 + 杀 playwright node
     try:
@@ -4380,6 +4629,17 @@ def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
     except Exception:
         pass
     _kill_playwright_node()
+
+    # 5. v8.4.12 关键：轮询等 playwright node.exe 真正退到 0（最多 ~10 秒）
+    #    node.exe 在 _MEI/playwright/driver/package/ 运行，持有临时目录文件锁。
+    #    必须确认它退出，PyInstaller bootloader 才能删掉 _MEI 目录。
+    for _ in range(20):
+        cnt = _count_playwright_node()
+        if cnt == 0:
+            break
+        if cnt > 0:
+            _kill_playwright_node()
+        _time.sleep(0.5)
 
 
 # v8.4.8: Playwright watcher 守护线程管理（防止 p.stop() 卡 atexit）
@@ -4422,42 +4682,29 @@ def _cleanup_all_playwright_contexts():
     except Exception:
         pass
 
-    # 1. 优雅关闭所有 Playwright contexts
-    for entry in list(_PLATFORM_BROWSER_RUNNERS):
+    # 1. v8.4.12: 通过 worker 线程 shutdown 共享浏览器（sync API 线程约束：
+    #    p/context 属于 worker 线程，主线程直接 close/stop 会跨线程报错）
+    #    worker shutdown 内部会 context.close() + p.stop()（driver 优雅退出，
+    #    node.exe 随之释放 _MEI 文件锁）
+    global _SHARED_BROWSER_SESSION
+    _worker_started = (
+        _SHARED_PW["thread"] is not None and _SHARED_PW["thread"].is_alive()
+    )
+    if _worker_started:
         try:
-            _, ctx_or_browser = entry
-            if ctx_or_browser is not None:
-                if hasattr(ctx_or_browser, 'close'):
-                    ctx_or_browser.close()
-                elif hasattr(ctx_or_browser, 'contexts'):
-                    ctx_or_browser.close()
+            _shared_pw_command("shutdown", timeout=15.0)
         except Exception:
             pass
+    _SHARED_BROWSER_SESSION = None
 
-    # 2. 优雅关闭共享 session（v8.4.4: launch_persistent_context 的 context）
-    if _SHARED_BROWSER_SESSION is not None:
-        try:
-            _, context, _, _ = _SHARED_BROWSER_SESSION
-            if context is not None and hasattr(context, 'close'):
-                context.close()
-        except Exception:
-            pass
-        _SHARED_BROWSER_SESSION = None
-
-    # 3. 停止所有 Playwright drivers
-    for entry in list(_PLATFORM_BROWSER_RUNNERS):
-        try:
-            p, _ = entry
-            if p is not None:
-                p.stop()
-        except Exception:
-            pass
+    # 2. 清空注册表（对象归 worker 线程所有，主线程不再触碰）
     _PLATFORM_BROWSER_RUNNERS.clear()
     _PLATFORM_BROWSER_SESSIONS.clear()
 
-    # 4. v8.4.8 关键：激进 taskkill 循环杀 Chromium 子进程
+    # 3. v8.4.8 关键：激进 taskkill 循环杀 Chromium 子进程
     #    atexit 阶段 PyInstaller 即将清理 _MEI 临时目录，必须等所有
     #    Chromium 子进程完全释放文件锁。多次 taskkill + 等待直到稳定 0 进程。
+    #    v8.4.12: 同时轮询等 playwright node.exe 退到 0（_MEI 锁的持有者）。
     if sys.platform == "win32":
         _aggressive_kill_chrome()
 
@@ -4493,6 +4740,11 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     - Playwright `launch_persistent_context` 让 chrome 用默认配置启动，无 CDP
       干扰，chrome 原生行为正常（点击链接开新 tab 加载）。
 
+    v8.4.12 根本性修复：所有 Playwright 操作收敛到唯一 worker 线程执行。
+    Playwright sync API 的对象绑定创建线程（greenlet），跨线程复用 context
+    会抛 "Target page, context or browser has been closed" 并累积 about:blank
+    残留 tab。worker 方案下 open/close 都经命令队列串行执行，线程安全。
+
     Returns:
         (ok: bool, error_msg: str)
     """
@@ -4501,71 +4753,6 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     if platform_key not in _PLATFORM_BROWSER_MAP:
         return False, f"不支持的平台: {platform_key}"
 
-    # v8.4.4: 复用 session：用 BrowserContext.new_page() 创建新 tab + goto
-    # v8.4.8: 修复"Target page, context or browser has been closed"
-    #   - context.new_page() 后必须 wait_for_load_state 等初始 about:blank 加载完成
-    #     （Playwright 内部要 200-500ms 注册新 page，否则立即 goto 会报"page closed"）
-    #   - goto 失败**不再**清 _SHARED_BROWSER_SESSION，只在 context 探测失败时清
-    # v8.4.11: 复用前清理所有 about:blank 残留 page（v8.4.10 失败时累积了 4 个 about:blank，
-    #   因为 page.close() 在 chrome 端已失效的 page 上抛异常被吞掉）
-    if _SHARED_BROWSER_SESSION is not None:
-        try:
-            _, context, _, _ = _SHARED_BROWSER_SESSION
-            # 探测 context 健康（防止 chrome 进程已死但 session 还指向它）
-            try:
-                _ = context.pages
-            except Exception as probe_err:
-                print(f"[{platform_key}] context 探测失败 {probe_err}，重启浏览器")
-                _SHARED_BROWSER_SESSION = None
-                # fall through 启动新 chrome
-
-            if _SHARED_BROWSER_SESSION is not None:
-                # v8.4.11: 清理上次失败留下的 about:blank 残留 page
-                # goto 失败时 page 可能在 Playwright 端已 close 但 Chrome 端 tab 还在
-                # 用 context.pages 列出所有 page，检查 URL 关闭 about:blank
-                try:
-                    for old_page in list(context.pages):
-                        try:
-                            url = old_page.url if not old_page.is_closed() else ""
-                            if url and url in ("about:blank", "chrome://newtab/", "chrome://newtab"):
-                                try:
-                                    old_page.close()
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                page = context.new_page()
-                page.set_default_navigation_timeout(20000)
-                # v8.4.8: 关键——等初始 about:blank 加载完成，给 Playwright 时间
-                # 在 server 端注册新 page。否则立即 goto 会因 page 还未注册
-                # 而抛"Target page, context or browser has been closed"。
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass  # about:blank 太快时直接返回
-                try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                except Exception as e1:
-                    try:
-                        # v8.4.8: 第二次尝试用 commit 模式（不等待 server 响应）
-                        page.goto(target_url, wait_until="commit", timeout=15000)
-                    except Exception as e2:
-                        # 失败不再清 session（避免雪崩），只关闭这一个失败 page
-                        try:
-                            if not page.is_closed():
-                                page.close()
-                        except Exception:
-                            pass
-                        return False, f"goto 失败: domcontentloaded={str(e1)[:80]}, commit={str(e2)[:80]}"
-                return True, ""
-        except Exception as e:
-            print(f"[{platform_key}] 共享 session 失效 {e}，重启浏览器")
-            _SHARED_BROWSER_SESSION = None
-
-    # v8.4.4: 用 Playwright launch_persistent_context（Playwright 完整管理 chrome）
     # chrome.exe 路径
     browser_path = _ensure_chromium_ready()
     if not browser_path:
@@ -4574,83 +4761,32 @@ def _open_platform_in_chromium(platform_key: str, target_url: str,
     # 共享 data_dir（所有平台 cookie 都存在这里，Chrome 按 URL 域名隔离）
     data_dir = _get_app_cache_dir("shared_browser_data")
 
-    # 强制解锁 data_dir（防 SingletonLock 残留）
-    _force_unlock_chromium_dir(data_dir)
+    # 仅在无活跃 session 时才需要强制解锁（有 session 说明锁被我们自己的
+    # chrome 正常持有，不能删）
+    if _SHARED_BROWSER_SESSION is None:
+        _force_unlock_chromium_dir(data_dir)
 
-    # 抑制 Playwright 子进程弹出 CMD 黑窗口
-    if sys.platform == "win32":
+    # 抑制 Playwright 子进程弹出 CMD 黑窗口（只 patch 一次，避免无限嵌套）
+    if sys.platform == "win32" and not getattr(_open_platform_in_chromium, "_popen_patched", False):
         _orig_popen = subprocess.Popen
         def _no_console_popen(*args, **kwargs):
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
             return _orig_popen(*args, **kwargs)
         subprocess.Popen = _no_console_popen
+        _open_platform_in_chromium._popen_patched = True
 
-    # 同步等待启动结果（Playwright launch_persistent_context 启动要 5-15 秒）
-    import threading as _threading
-    ready_event = _threading.Event()
-    result = {"ok": False, "error": "未启动", "p": None, "context": None}
-
-    def _launch():
-        try:
-            from playwright.sync_api import sync_playwright
-            p = sync_playwright().start()
-            # launch_persistent_context：Playwright 用自家 driver 启动 chrome
-            # 不用 subprocess.Popen + CDP，避免 CDP 干扰 chrome 原生 tab 行为
-            # v8.4.6: launch_persistent_context 报"Executable doesn't exist at chromium-1234"
-            #   因为我们打的是 chromium-1208 而 Playwright 1.62 内部期望 chromium-1234。
-            #   用 executable_path 强制使用我们 embedded 的 chromium-1208。
-            # v8.4.5: launch_persistent_context 不允许 args 里带 URL（"Arguments can
-            #   not specify page to be opened"）。先启动 chrome，复用初始 New Tab Page
-            #   用 pages[0].goto(target_url) 跳转，避免双 tab。
-            _chrome_exe_path = os.path.join(browser_path, "chrome.exe")
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=data_dir,
-                headless=False,
-                executable_path=_chrome_exe_path,
-                viewport={"width": 1280, "height": 800},
-                args=[
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-                ignore_default_args=["--no-sandbox"],
-                timeout=30000,
-            )
-            # 复用 chrome 启动时的初始 New Tab Page（只有一个 tab）
-            # v8.4.8: launch_persistent_context 刚返回时 initial New Tab Page
-            #   还是 about:blank / chrome://newtab，要等它先稳定再 goto
-            #   否则新 page 注册未完成时 goto 报"Target page closed"
-            pages = context.pages
-            if pages:
-                initial = pages[0]
-                # 等初始 New Tab Page 完成加载
-                try:
-                    initial.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
-                try:
-                    initial.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                except Exception as e1:
-                    try:
-                        initial.goto(target_url, wait_until="commit", timeout=15000)
-                    except Exception:
-                        pass
-            _PLATFORM_BROWSER_RUNNERS.append((p, context))
-            _SHARED_BROWSER_SESSION = (p, context, None, 0)
-            result["ok"] = True
-            result["error"] = ""
-            result["p"] = p
-            result["context"] = context
-            ready_event.set()
-        except Exception as e:
-            result["error"] = str(e)[:200]
-            ready_event.set()
-
-    _threading.Thread(target=_launch, daemon=True).start()
-
-    if ready_event.wait(timeout=wait_timeout + 5):
-        return result["ok"], result["error"]
-    return False, "启动超时"
+    # 通过 worker 线程执行 open（launch 或复用 + 新 tab 导航）
+    _chrome_exe_path = os.path.join(browser_path, "chrome.exe")
+    ok, err = _shared_pw_command(
+        "open",
+        payload=(target_url, data_dir, _chrome_exe_path),
+        timeout=wait_timeout + 15,
+    )
+    if ok:
+        _SHARED_BROWSER_SESSION = True  # 活跃标志（实际对象在 worker 线程内）
+        return True, ""
+    _SHARED_BROWSER_SESSION = None
+    return False, err or "启动失败"
 
 
 # ─── yt-dlp 降级方案 ──────────────────────────────────────
@@ -4760,21 +4896,16 @@ def extract_streams(url: str, proxy: str = "") -> dict:
         except Exception as e:
             # 快手/淘宝直播/视频号/小红书等 yt-dlp 不支持的平台，不要降级到 yt-dlp
             if platform in ("快手", "淘宝直播", "小红书", "抖音", "YY直播"):
+                # v8.4.12: 精简错误文案（之前 20 行长弹窗，用户无法快速读懂）
+                _err_short = str(e).replace("\n", " ").strip()[:80]
                 raise Exception(
-                    f"{platform}专属解析失败。\n"
-                    f"错误信息: {e}\n\n"
-                    f"解析依赖浏览器自动化（Playwright）。\n"
-                    f"可能原因：\n"
-                    f"  1) Playwright 浏览器未安装或启动失败\n"
-                    f"  2) 反爬拦截（请求过快）\n"
-                    f"  3) 未登录账号（需要登录才能获取流地址）\n"
-                    f"  4) 浏览器被关闭或超时\n\n"
-                    f"解决方案：\n"
-                    f"  - 确保电脑已安装 Chromium 浏览器\n"
-                    f"  - 点击状态栏平台标注登录账号\n"
-                    f"  - 点击解析后等待浏览器弹出并加载页面\n"
-                    f"  - 如遇到验证码，请在弹出的浏览器中手动完成\n"
-                    f"  - 等1-2分钟后重试"
+                    f"{platform}解析失败\n\n"
+                    f"原因：{_err_short}\n\n"
+                    f"建议：\n"
+                    f"  1) 确认主播正在直播\n"
+                    f"  2) 点上方平台按钮登录后重试\n"
+                    f"  3) 遇验证码请在浏览器中手动完成\n"
+                    f"  4) 等 1-2 分钟后再试"
                 )
             log_msg = f"[专属解析] {platform}解析失败: {e}，降级到yt-dlp..."
 
