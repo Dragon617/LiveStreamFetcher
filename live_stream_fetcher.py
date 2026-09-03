@@ -841,7 +841,7 @@ def _ks_fetch_via_playwright(url, room_id):
                 try:
                     context = p.chromium.launch_persistent_context(
                         user_data_dir,
-                        channel=_first_fallback_channel(),
+                        **_default_launch_override(_first_fallback_channel()),
                         **launch_kwargs,
                     )
                 except Exception as e1:
@@ -1710,7 +1710,7 @@ def _dy_fetch_via_playwright(url: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                        user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -2437,7 +2437,7 @@ def _xhs_fetch_via_playwright(url: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                        user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -3216,7 +3216,7 @@ def _tb_fetch_via_playwright(url: str, live_id: str) -> dict:
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                        user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -3767,7 +3767,7 @@ def _yy_fetch_via_playwright(url: str, room_id: str):
             if not context:
                 try:
                     context = p.chromium.launch_persistent_context(
-                        user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                        user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                     )
                 except Exception as e1:
                     launch_errors.append(f"Chromium: {e1}")
@@ -4302,6 +4302,16 @@ def _douyu_fetch_via_playwright(room_id: str, probe: dict):
                     )
                 except Exception as e_embed:
                     launch_errors.append(f"Embedded: {e_embed}")
+            # v8.5.5: 系统引擎模式优先用系统默认浏览器 exe（Chrome/Edge）
+            if not context and _prefer_system_browser():
+                _dexe = _find_default_browser_exe()
+                if _dexe:
+                    try:
+                        print(f"[斗鱼 Playwright] 使用系统默认浏览器: {_dexe}")
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir, executable_path=_dexe, **launch_kwargs)
+                    except Exception as e_dexe:
+                        launch_errors.append(f"DefaultBrowser: {e_dexe}")
             if not context:
                 for ch in (_first_fallback_channel(), "chrome", "msedge"):
                     try:
@@ -5309,6 +5319,64 @@ def _first_fallback_channel():
     避免选错浏览器导致直播页面视频加载不出。
     """
     return "chrome" if _prefer_system_browser() else None
+
+
+def _find_default_browser_exe() -> str:
+    """查找 Windows **默认浏览器** exe（仅 Chromium 系白名单：chrome.exe / msedge.exe）。
+
+    读取 HKCU UrlAssociations\\http\\UserChoice ProgId →
+    Classes\\{ProgId}\\shell\\open\\command 解析 exe 路径。
+
+    v8.5.5: 系统引擎模式下解析直播流也调用系统默认浏览器（用户明确要求：
+    之前固定调 Chrome，默认浏览器为 Edge 等其他浏览器时与用户预期不符）。
+    非 Chromium 系默认浏览器（如国产壳浏览器）返回 ""——Playwright 仅保证
+    驱动 Chrome/Edge，回退走 channel 链。
+    """
+    _CHROMIUM_EXES = {"chrome.exe", "msedge.exe"}
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        ) as k:
+            progid, _ = winreg.QueryValueEx(k, "ProgId")
+        cmd = ""
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, rf"SOFTWARE\Classes\{progid}\shell\open\command") as k:
+                    cmd, _ = winreg.QueryValueEx(k, None)
+                    break
+            except Exception:
+                continue
+        if not cmd:
+            return ""
+        m = re.match(r'"?([^"]+?\.exe)"?', cmd.strip())
+        if not m:
+            return ""
+        exe = m.group(1)
+        if os.path.isfile(exe) and os.path.basename(exe).lower() in _CHROMIUM_EXES:
+            return exe
+    except Exception:
+        pass
+    return ""
+
+
+def _default_launch_override(fallback_channel):
+    """launch_persistent_context 启动参数覆盖（系统引擎 → 默认浏览器 exe 优先）。
+
+    系统引擎模式且默认浏览器为 Chrome/Edge：返回 {"executable_path": exe}
+    ——解析直播流也调用**系统默认浏览器**（v8.5.5 用户要求）。
+    否则返回 {"channel": fallback_channel}（维持 v8.5.0 行为）。
+    用法：launch_persistent_context(dir, **_default_launch_override(_first_fallback_channel()), **kwargs)
+    """
+    if _prefer_system_browser():
+        exe = _find_default_browser_exe()
+        if exe:
+            print(f"[引擎] 解析使用系统默认浏览器: {exe}")
+            return {"executable_path": exe}
+    return {"channel": fallback_channel}
 
 
 # v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
@@ -10213,7 +10281,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                            user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -10425,7 +10493,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                            user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -10678,7 +10746,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                            user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                         )
                     except Exception:
                         try:
@@ -10881,7 +10949,7 @@ class LiveStreamFetcherApp:
                 if not context:
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir, channel=_first_fallback_channel(), **launch_kwargs,
+                            user_data_dir, **_default_launch_override(_first_fallback_channel()), **launch_kwargs,
                         )
                     except Exception:
                         try:

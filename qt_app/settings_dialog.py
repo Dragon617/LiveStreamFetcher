@@ -3,8 +3,9 @@
 
 当前设置项：
   - 浏览器引擎：本软件内置浏览器（Chrome for Testing，推荐）
-               / 电脑自带浏览器（v8.5.3 起 = 系统默认浏览器，
-                 点平台按钮 os.startfile 打开；解析仍用 Chrome/Edge）
+               / 电脑自带浏览器（= 系统默认浏览器：点平台按钮 os.startfile
+                 打开；v8.5.5 起解析直播流也调用默认浏览器 exe，
+                 仅 Chrome/Edge 白名单，其余默认浏览器回退 channel 链）
 
 配置通过业务层 `_get_browser_engine()` / `_set_browser_engine()` 持久化到
 缓存根目录 settings.json，平台登录浏览器与解析浏览器共用同一引擎。
@@ -147,7 +148,7 @@ class SettingsDialog(QDialog):
         )
         self._card_system = _EngineCard(
             "电脑自带浏览器（系统默认浏览器）",
-            "点平台按钮用系统默认浏览器打开；解析直播流仍调用 Chrome / Edge",
+            "点平台按钮与解析直播流均调用系统默认浏览器（登录数据独立保存）",
         )
         self._card_builtin.clicked.connect(lambda: self._select("builtin"))
         self._card_system.clicked.connect(lambda: self._select("system"))
