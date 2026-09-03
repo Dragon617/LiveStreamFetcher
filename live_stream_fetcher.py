@@ -5379,6 +5379,198 @@ def _default_launch_override(fallback_channel):
     return {"channel": fallback_channel}
 
 
+# ═══════════════════════════════════════════════════════
+# v8.5.6: 从系统默认浏览器导入登录状态
+# ═══════════════════════════════════════════════════════
+#
+# 背景：系统引擎模式下解析直播流调用默认浏览器 exe，但使用的是软件自己的
+# shared_browser_data 数据目录——用户日常浏览器里已登录的直播平台在解析
+# 窗口里仍是未登录。
+# 原理（PoC 实证）：Chrome/Edge 的 Cookie 加密（含 127+ App-Bound）绑定的是
+# **浏览器 exe + OS 用户**，与 profile 目录位置无关——把日常浏览器的
+# Local State + Cookies 复制到 shared_browser_data，用同一 exe 打开即可
+# 正常解密，登录态完整复用。
+# 注意：导入会覆盖软件内现有登录态（自动备份）；Cookie DB 被运行中的
+# 浏览器独占锁定（WinError 32 实证），必须先关闭浏览器再复制。
+
+def _get_default_browser_user_data_dir() -> str:
+    """系统默认浏览器（Chrome/Edge）的 User Data 目录。非白名单返回 ""。"""
+    exe = _find_default_browser_exe()
+    name = os.path.basename(exe).lower() if exe else ""
+    la = os.environ.get("LOCALAPPDATA", "")
+    if name == "msedge.exe":
+        return os.path.join(la, "Microsoft", "Edge", "User Data")
+    if name == "chrome.exe":
+        return os.path.join(la, "Google", "Chrome", "User Data")
+    return ""
+
+
+def _close_default_browser(grace_sec: float = 8.0) -> None:
+    """关闭系统默认浏览器（先 WM_CLOSE 优雅等待，存活者 /F /T 兜底）。
+
+    实证：Edge 后台模式会在 WM_CLOSE 后自动重启主进程，必须 /F /T 杀树。
+    只匹配默认浏览器 exe 的主进程（不含 --type= 子进程），
+    不碰本软件 shared_browser_data 启动的浏览器实例。
+    """
+    import time as _time
+    exe = _find_default_browser_exe()
+    if not exe:
+        return
+    exe_name = os.path.basename(exe)
+    shared_dir = _get_app_cache_dir("shared_browser_data").lower()
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    def _main_pids() -> list:
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Get-CimInstance Win32_Process -Filter \"Name='{exe_name}'\" | "
+                 "Where-Object { $_.CommandLine -and $_.CommandLine -notlike '*--type=*' } | "
+                 "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, creationflags=NO_WINDOW)
+            out = []
+            for ln in (r.stdout or "").splitlines():
+                ln = ln.strip()
+                if not ln or "|" not in ln:
+                    continue
+                pid, cmdline = ln.split("|", 1)
+                # 跳过本软件启动的实例（shared_browser_data）
+                if shared_dir in cmdline.lower():
+                    continue
+                if pid.strip().isdigit():
+                    out.append(pid.strip())
+            return out
+        except Exception:
+            return []
+
+    # 1. WM_CLOSE 优雅关闭
+    for pid in _main_pids():
+        try:
+            subprocess.run(["taskkill", "/PID", pid], capture_output=True,
+                           timeout=5, creationflags=NO_WINDOW)
+        except Exception:
+            pass
+    deadline = _time.time() + grace_sec
+    while _time.time() < deadline:
+        if not _main_pids():
+            break
+        _time.sleep(0.5)
+    # 2. /F /T 兜底（后台模式存活的进程树）
+    for pid in _main_pids():
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", pid], capture_output=True,
+                           timeout=5, creationflags=NO_WINDOW)
+        except Exception:
+            pass
+    _time.sleep(1.5)  # 等 cookie flush 与文件锁释放
+
+
+def import_login_from_default_browser() -> tuple:
+    """从系统默认浏览器导入登录状态到 shared_browser_data。
+
+    流程：关闭默认浏览器 → 备份现有 shared profile → 复制
+    Local State + Cookies + Local Storage → 重启用户浏览器 → 统计导入结果。
+
+    Returns:
+        (ok: bool, message: str)
+    """
+    import time as _time
+    exe = _find_default_browser_exe()
+    if not exe:
+        return False, "系统默认浏览器不是 Chrome/Edge，无法导入（仅支持 Chromium 系默认浏览器）"
+    ud = _get_default_browser_user_data_dir()
+    if not ud or not os.path.isdir(ud):
+        return False, f"未找到默认浏览器数据目录: {ud}"
+    src_local_state = os.path.join(ud, "Local State")
+    src_cookies = os.path.join(ud, "Default", "Network", "Cookies")
+    cookies_in_network = True
+    if not os.path.isfile(src_cookies):
+        src_cookies = os.path.join(ud, "Default", "Cookies")
+        cookies_in_network = False
+    if not os.path.isfile(src_cookies):
+        return False, "默认浏览器中未找到 Cookie 数据库（尚未产生任何登录数据）"
+
+    # 1. 先关闭本软件解析浏览器（释放 shared_browser_data 锁），再关默认浏览器
+    try:
+        _graceful_kill_profile_chrome("shared_browser_data", grace_sec=3.0)
+    except Exception:
+        pass
+    browser_name = "Edge" if "msedge" in exe.lower() else "Chrome"
+    _close_default_browser()
+
+    # 2. 备份现有 shared profile
+    data_dir = _get_app_cache_dir("shared_browser_data")
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = f"{data_dir}_before_import_{ts}"
+    try:
+        if os.path.isdir(data_dir):
+            os.replace(data_dir, backup_dir)
+            print(f"[登录导入] 原登录数据已备份: {backup_dir}")
+    except Exception as e:
+        return False, f"备份现有登录数据失败（{e}），已中止导入以防数据丢失"
+
+    # 3. 复制登录态文件
+    try:
+        os.makedirs(os.path.join(data_dir, "Default", "Network"), exist_ok=True)
+        if os.path.isfile(src_local_state):
+            shutil.copy2(src_local_state, os.path.join(data_dir, "Local State"))
+        if cookies_in_network:
+            shutil.copy2(src_cookies, os.path.join(data_dir, "Default", "Network", "Cookies"))
+        else:
+            shutil.copy2(src_cookies, os.path.join(data_dir, "Default", "Cookies"))
+        # Local Storage（部分平台令牌在此，尽力而为）
+        src_ls = os.path.join(ud, "Default", "Local Storage")
+        if os.path.isdir(src_ls):
+            try:
+                shutil.copytree(src_ls, os.path.join(data_dir, "Default", "Local Storage"))
+            except Exception as e_ls:
+                print(f"[登录导入] Local Storage 复制不完整（忽略）: {str(e_ls)[:60]}")
+    except Exception as e:
+        # 复制失败：回滚备份
+        try:
+            shutil.rmtree(data_dir, ignore_errors=True)
+            os.replace(backup_dir, data_dir)
+        except Exception:
+            pass
+        return False, f"复制登录数据失败: {e}（已回滚原有登录数据）"
+    finally:
+        # 4. 无论成败，重启用户的浏览器（恢复工作现场）
+        try:
+            NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            subprocess.Popen([exe], creationflags=NO_WINDOW)
+        except Exception:
+            pass
+
+    # 5. 统计导入结果（分平台计数）
+    counts = {}
+    try:
+        import sqlite3
+        dst_ck = os.path.join(data_dir, "Default", "Network", "Cookies")
+        if not os.path.isfile(dst_ck):
+            dst_ck = os.path.join(data_dir, "Default", "Cookies")
+        con = sqlite3.connect(dst_ck)
+        cur = con.cursor()
+        for label, pat in (("斗鱼", "%douyu%"), ("虎牙", "%huya%"), ("快手", "%kuaishou%"),
+                           ("抖音", "%douyin%"), ("小红书", "%xiaohongshu%"),
+                           ("淘宝", "%taobao%"), ("YY", "%yy.com%")):
+            cur.execute("SELECT COUNT(*) FROM cookies WHERE host_key LIKE ?", (pat,))
+            n = cur.fetchone()[0]
+            if n:
+                counts[label] = n
+        cur.execute("SELECT COUNT(*) FROM cookies")
+        total = cur.fetchone()[0]
+        con.close()
+    except Exception:
+        total = -1
+
+    parts = [f"{k} {v} 条" for k, v in counts.items()]
+    detail = ("、".join(parts)) if parts else "未检测到直播平台 Cookie"
+    return True, (f"已从 {browser_name} 导入登录状态（共 {total} 条 Cookie）：\n{detail}\n\n"
+                  f"原软件内登录数据已备份到：\n{backup_dir}\n\n"
+                  f"{browser_name} 已自动重新打开。之后解析直播流即可复用这些登录状态。")
+
+
 # v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
 def _aggressive_kill_chrome(max_rounds: int = 3) -> None:
     """多次轮询 taskkill /IM chrome.exe + node.exe（playwright driver），
