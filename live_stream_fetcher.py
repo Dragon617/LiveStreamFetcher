@@ -607,8 +607,14 @@ def _sanitize_profile_for_launch(user_data_dir: str) -> None:
     "Target page, context or browser has been closed"——所有平台按钮全灭。
     仅删除 `Default/Sync Data` 即可恢复，且不影响平台登录态（Cookies/Login Data
     在别处）。自动化 profile 不使用 Google 同步，删除无代价。
+
+    v8.5.7：系统引擎模式下**不清理**——全量克隆导入的 profile 与默认浏览器
+    同源（Edge 打开 Edge 的 Sync Data 无兼容问题），且 Sync Data 属于
+    会话状态的一部分，保留有利于平台登录态验证。
     """
     if not user_data_dir:
+        return
+    if _prefer_system_browser():
         return
     try:
         import shutil
@@ -5469,8 +5475,15 @@ def _close_default_browser(grace_sec: float = 8.0) -> None:
 def import_login_from_default_browser() -> tuple:
     """从系统默认浏览器导入登录状态到 shared_browser_data。
 
-    流程：关闭默认浏览器 → 备份现有 shared profile → 复制
-    Local State + Cookies + Local Storage → 重启用户浏览器 → 统计导入结果。
+    流程：关闭默认浏览器 → 备份现有 shared profile → **全量克隆 profile**
+    （Local State + 整个 Default，排除缓存目录）→ 重启用户浏览器 → 统计导入结果。
+
+    v8.5.7 实证（Edge 152）：只复制 Cookies/Local Storage 三件套会被浏览器
+    反盗链机制整体清除（2344→9，启动后异步 purge）；全量克隆后纯 Cookie
+    平台（斗鱼/虎牙/YY）登录态可长期复用；抖音/快手/小红书/淘宝启用
+    DBSC 设备绑定（Device Bound Sessions，密钥 TPM 密封且绑定原 profile
+    身份），跨 profile 无法迁移——这 4 个平台需在解析浏览器里登录一次
+    （登录一次后长期保持，无需重复扫码）。
 
     Returns:
         (ok: bool, message: str)
@@ -5510,22 +5523,26 @@ def import_login_from_default_browser() -> tuple:
     except Exception as e:
         return False, f"备份现有登录数据失败（{e}），已中止导入以防数据丢失"
 
-    # 3. 复制登录态文件
+    # 3. v8.5.7: 全量克隆 profile（三件套会被反盗链机制整体清除——实证）
+    #    排除与登录态无关的重型缓存目录
+    _EXCLUDE = (
+        "Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache",
+        "ShaderCache", "GrShaderCache", "GraphiteDawnCache", "BrowserMetrics",
+        "Crashpad", "component_crx_cache", "extensions_crx_cache", "Crowd Deny",
+        "MEIPreload", "OnDeviceHeadSuggestModel", "SafetyTips", "Subresource Filter",
+        "File System", "Service Worker", "blob_storage", "VideoDecodeStats",
+        "Segmentation Platform", "OptimizationHints", "AutofillAiModelCache",
+        "history_journeys", "HistoryClusters",
+    )
     try:
-        os.makedirs(os.path.join(data_dir, "Default", "Network"), exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
         if os.path.isfile(src_local_state):
             shutil.copy2(src_local_state, os.path.join(data_dir, "Local State"))
-        if cookies_in_network:
-            shutil.copy2(src_cookies, os.path.join(data_dir, "Default", "Network", "Cookies"))
-        else:
-            shutil.copy2(src_cookies, os.path.join(data_dir, "Default", "Cookies"))
-        # Local Storage（部分平台令牌在此，尽力而为）
-        src_ls = os.path.join(ud, "Default", "Local Storage")
-        if os.path.isdir(src_ls):
-            try:
-                shutil.copytree(src_ls, os.path.join(data_dir, "Default", "Local Storage"))
-            except Exception as e_ls:
-                print(f"[登录导入] Local Storage 复制不完整（忽略）: {str(e_ls)[:60]}")
+        shutil.copytree(
+            os.path.join(ud, "Default"),
+            os.path.join(data_dir, "Default"),
+            ignore=shutil.ignore_patterns(*_EXCLUDE),
+        )
     except Exception as e:
         # 复制失败：回滚备份
         try:
@@ -5566,9 +5583,13 @@ def import_login_from_default_browser() -> tuple:
 
     parts = [f"{k} {v} 条" for k, v in counts.items()]
     detail = ("、".join(parts)) if parts else "未检测到直播平台 Cookie"
-    return True, (f"已从 {browser_name} 导入登录状态（共 {total} 条 Cookie）：\n{detail}\n\n"
+    return True, (f"已从 {browser_name} 全量导入登录数据（共 {total} 条 Cookie）：\n{detail}\n\n"
+                  f"【可直接复用登录】斗鱼、虎牙、YY 等纯 Cookie 平台\n"
+                  f"【需在解析浏览器登录一次】抖音、快手、小红书、淘宝——这些平台启用了\n"
+                  f"「设备绑定保护」（DBSC），登录数据与浏览器环境加密绑定，无法跨目录\n"
+                  f"迁移，只能在解析浏览器里各扫码登录一次（之后长期保持，不用重复登录）。\n\n"
                   f"原软件内登录数据已备份到：\n{backup_dir}\n\n"
-                  f"{browser_name} 已自动重新打开。之后解析直播流即可复用这些登录状态。")
+                  f"{browser_name} 已自动重新打开。")
 
 
 # v8.4.8: 激进 taskkill 清理 Chromium 子进程（多次轮询直到 0 进程）
