@@ -7929,9 +7929,14 @@ def _find_wechat_video_tool():
         for base in [exe_dir, meipass_base, cached_dir, appdata_dir]:
             if not base:
                 continue
-            p = os.path.join(base, exe_name) if base == exe_dir or base == meipass_base else os.path.join(base, exe_name)
-            if os.path.isfile(p):
-                return p
+            # v8.5.8: _MEIPASS/_internal 下工具位于 wechat_video_tool 子目录
+            # （spec datas 映射 wechatVideoDownload2.8 → wechat_video_tool），
+            # 旧实现只在根级查找导致 onedir/onefile 内嵌副本永远找不到，
+            # 总是落到缓存释放副本（甚至可能过期）。
+            for p in (os.path.join(base, exe_name),
+                      os.path.join(base, "wechat_video_tool", exe_name)):
+                if os.path.isfile(p):
+                    return p
     return None
 
 
@@ -7964,8 +7969,36 @@ def _extract_embedded_wechat_video_tool():
         return None
 
 
+def _is_onefile_temp_meipass() -> bool:
+    """当前是否为 onefile EXE（_MEIPASS 指向 %TEMP% 临时目录）。
+
+    onefile 运行时 _MEIPASS = %TEMP%\\_MEIxxxxx（退出即清）；
+    onedir 的 _MEIPASS = <EXE目录>/_internal（磁盘持久）。
+    v8.5.8 用于决定视频号工具是否需要先释放到持久缓存目录。
+    """
+    if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
+        return False
+    try:
+        import tempfile
+        tmp = os.path.abspath(tempfile.gettempdir())
+        return os.path.commonpath([os.path.abspath(sys._MEIPASS), tmp]) == tmp
+    except Exception:
+        return False
+
+
 def _ensure_wechat_video_tool():
-    """确保微信视频号下载工具可用：查找 → 释放。返回 EXE 路径或 None。"""
+    """确保微信视频号下载工具可用：查找 → 释放。返回 EXE 路径或 None。
+
+    v8.5.8：onefile 模式强制先释放到持久缓存目录（cache/.../wechat_video_tool/）。
+    原逻辑在 _MEIPASS 临时目录里找到就直接返回并从那里启动——工具的
+    「缓存/下载」会写入 %TEMP%\\_MEIxxxxx 随退出蒸发（用户要求工具目录
+    结构 缓存/下载 必须保持在持久位置不变）。onedir 的 _internal 本身
+    持久，仍可直接使用。
+    """
+    if _is_onefile_temp_meipass():
+        cached = _extract_embedded_wechat_video_tool()
+        if cached:
+            return cached
     path = _find_wechat_video_tool()
     if path:
         return path
@@ -8003,7 +8036,9 @@ def _install_wechat_certificates(cert_dir: str) -> bool:
         try:
             results.append(_install_one_p12_via_crypto(p12))
         except Exception as e:
-            print(f"[视频号证书] {os.path.basename(p12)} ❌ 异常: {e}")
+            # v8.5.8: 日志用 ASCII——GBK 控制台/重定向下 emoji 会抛
+            # UnicodeEncodeError 掩盖真实异常并阻断工具启动（实证）
+            print(f"[视频号证书] {os.path.basename(p12)} [FAIL] 异常: {e}")
             results.append(False)
     return all(results)
 
@@ -8084,12 +8119,19 @@ def _install_one_p12_via_crypto(p12_path: str) -> bool:
             finally:
                 crypt32.CertCloseStore(target, 0)
     ok = added_count >= len(certs) * 2  # Root + My 两个 store，每个 cert 都要加上
-    print(f"[视频号证书] {os.path.basename(p12_path)} {'✅' if ok else '⚠️'} cert={len(certs)} added={added_count}")
+    # v8.5.8: 日志用 ASCII（GBK 控制台打印 emoji 会崩，见 _install_wechat_certificates 注释）
+    print(f"[视频号证书] {os.path.basename(p12_path)} {'[OK]' if ok else '[WARN]'} cert={len(certs)} added={added_count}")
     return ok
 
 
 def is_wechat_certificates_installed(cert_dir: str = None) -> bool:
-    """检查视频号证书是否已安装（Root CA store 里有 mitmproxy 证书）。"""
+    """检查视频号证书是否已安装（Root CA store 里有 mitmproxy 证书）。
+
+    v8.5.8 重写：旧实现 CertEnumCertificatesInStore 只传一个参数（API 原型
+    为 (store, prev_ctx) 双参），且按友好名匹配——枚举行为未定义、友好名
+    可能未设置，导致校验永远 False（实证）。改为按 p12 证书 SHA1 指纹
+    用 CertFindCertificateInStore 精确查找（CERT_FIND_SHA1_HASH）。
+    """
     if sys.platform != "win32":
         return True
     cert_dir = cert_dir or os.path.join(
@@ -8103,32 +8145,56 @@ def is_wechat_certificates_installed(cert_dir: str = None) -> bool:
         return False
     try:
         import ctypes
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.backends import default_backend
+
+        # 收集两个 p12 中所有证书的 SHA1 指纹
+        thumbprints = []
+        for p12 in p12_files:
+            with open(p12, "rb") as f:
+                data = f.read()
+            key, cert, adds = pkcs12.load_key_and_certificates(
+                data, password=None, backend=default_backend()
+            )
+            for c in ([cert] if cert else []) + list(adds or []):
+                thumbprints.append(c.fingerprint(hashes.SHA1()))
+        if not thumbprints:
+            return False
+
+        class CRYPT_HASH_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.c_char_p)]
+
         crypt32 = ctypes.WinDLL("crypt32.dll")
+        crypt32.CertOpenSystemStoreW.restype = ctypes.c_void_p
+        crypt32.CertOpenSystemStoreW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        crypt32.CertFindCertificateInStore.restype = ctypes.c_void_p
+        crypt32.CertFindCertificateInStore.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        X509_ASN_ENCODING = 0x00000001
+        CERT_FIND_SHA1_HASH = 1
         store = crypt32.CertOpenSystemStoreW(None, "Root")
         if not store:
             return False
+        # v8.5.8: c_void_p restype 返回的 Python int 可能带符号高位，
+        # 直接回传 c_void_p argtype 会 OverflowError（实证）——显式包一层指针
+        hstore = ctypes.c_void_p(store)
         try:
-            crypt32.CertEnumCertificatesInStore.restype = ctypes.c_void_p
-            crypt32.CertEnumCertificatesInStore.argtypes = [ctypes.c_void_p]
-            ctx = crypt32.CertEnumCertificatesInStore(store)
-            while ctx:
-                # CERT_FRIENDLY_NAME_PROP_ID = 0x01
-                buf = (ctypes.c_char * 1024)()
-                size = ctypes.c_uint(1024)
-                if crypt32.CertGetCertificateContextProperty(
-                    ctx, 0x01, buf, ctypes.byref(size)
-                ):
-                    try:
-                        name = buf.value.decode("utf-16-le", errors="ignore")
-                        if "mitmproxy" in name.lower() or "charles" in name.lower():
-                            return True
-                    except Exception:
-                        pass
-                ctx = crypt32.CertEnumCertificatesInStore(store)
+            for tp in thumbprints:
+                blob = CRYPT_HASH_BLOB(len(tp), tp)
+                ctx = crypt32.CertFindCertificateInStore(
+                    hstore, X509_ASN_ENCODING, 0, CERT_FIND_SHA1_HASH,
+                    ctypes.byref(blob), None,
+                )
+                if ctx:
+                    return True
             return False
         finally:
-            crypt32.CertCloseStore(store, 0)
-    except Exception:
+            crypt32.CertCloseStore(hstore, 0)
+    except Exception as e:
+        print(f"[视频号证书] 安装校验异常: {str(e)[:80]}")
         return False
 
 

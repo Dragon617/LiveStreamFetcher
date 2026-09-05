@@ -39,7 +39,25 @@ def _inject_demo_streams(window: MainWindow) -> None:
     window.render_streams(demo, platform="小红书")
 
 
+def _guard_console_encoding() -> None:
+    """v8.5.8: stdout/stderr 编码兜底——重配置为 UTF-8 + errors=replace。
+
+    实证：GBK 控制台/重定向下 print 含 emoji（✅❌⚠️）的日志会抛
+    UnicodeEncodeError，曾在证书安装成功路径上崩溃并阻断视频号工具启动
+    （'gbk' codec can't encode character '\\u274c'）。
+    窗口版 EXE 无控制台时 stdout 为 None，reconfigure 不存在则跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _guard_console_encoding()
+
     # 高分屏适配
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

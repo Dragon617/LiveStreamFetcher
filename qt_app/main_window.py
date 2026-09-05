@@ -569,7 +569,16 @@ class MainWindow(QMainWindow):
             self.platform_info_label.setText(f"系统代理操作失败：{e}")
 
     def _on_wechat_tool(self):
-        """启动视频号下载工具（v8.3.2：启动前先安装 mitmproxy CA 证书）。"""
+        """启动视频号下载工具。
+
+        流程（用户明确要求）：先安装 缓存\\证书.p12 + 证书-cert.p12
+        到 Windows 证书存储 → 再打开视频号工具。
+        v8.5.8 加固：
+        - 证书安装独立 try/except——任何证书侧异常（含 GBK 日志崩溃）
+          都不再阻断工具启动（v8.5.7 实证 emoji 打印崩溃导致工具无法打开）
+        - 启动前确保工具目录下「下载」目录存在（打包不含空目录，
+          保持 工具目录/{缓存,下载} 原有结构）
+        """
         try:
             from live_stream_fetcher import _ensure_wechat_video_tool, _install_wechat_certificates
             exe_path = _ensure_wechat_video_tool()
@@ -577,23 +586,33 @@ class MainWindow(QMainWindow):
                 self.platform_info_label.setText("视频号工具未找到")
                 return
 
-            # v8.3.2: 先安装证书（视频号工具抓 HTTPS 视频必需）
-            # v8.4.13: 证书在工具目录的"缓存"子目录中（保持原目录结构）
             _exe_dir = os.path.dirname(exe_path)
+            # 保持工具目录原有结构：确保「下载」目录存在
+            try:
+                os.makedirs(os.path.join(_exe_dir, "下载"), exist_ok=True)
+            except Exception:
+                pass
+
+            # 先安装证书（视频号工具抓 HTTPS 视频必需）
+            # v8.4.13: 证书在工具目录的"缓存"子目录中（保持原目录结构）
             cert_dir = os.path.join(_exe_dir, "缓存")
             if not os.path.isdir(cert_dir):
                 cert_dir = _exe_dir  # 兼容旧版平铺结构
             self.platform_info_label.setText("正在安装视频号工具证书...")
             from PySide6.QtWidgets import QApplication
             QApplication.processEvents()
-            if _install_wechat_certificates(cert_dir):
-                self.platform_info_label.setText("视频号工具证书已安装，正在启动...")
-            else:
-                self.platform_info_label.setText("视频号工具证书安装失败，仍尝试启动...")
+            cert_msg = "证书安装异常，仍尝试启动"
+            try:
+                if _install_wechat_certificates(cert_dir):
+                    cert_msg = "证书已安装"
+                else:
+                    cert_msg = "证书安装未完全成功，仍尝试启动"
+            except Exception as e_cert:
+                print(f"[视频号证书] 安装流程异常（不阻断启动）: {str(e_cert)[:120]}")
 
             import subprocess
             subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
-            self.platform_info_label.setText("视频号下载工具已启动")
+            self.platform_info_label.setText(f"视频号下载工具已启动（{cert_msg}）")
         except Exception as e:
             self.platform_info_label.setText(f"视频号工具启动失败：{e}")
 
