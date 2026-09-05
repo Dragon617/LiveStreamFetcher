@@ -12492,14 +12492,19 @@ class LiveStreamFetcherApp:
 
 # ─── 启动密码验证 ────────────────────────────────────────────────
 
-PASSWORD_DOC_URL = "https://www.yuque.com/r/note/11037a5a-b85f-4c41-bf08-2fe003b7afcd"
+PASSWORD_DOC_URL = "https://www.yuque.com/r/note/bfa09eb6-2a61-423b-9874-b286c3c4da83"
 
 # 内存密码缓存（避免频繁请求文档）
 _cached_password = None
 _cached_password_time = 0
-PASSWORD_CACHE_SECONDS = 24 * 60 * 60  # 24 小时缓存（云端改密码后最长 24 小时内同步）
+PASSWORD_CACHE_SECONDS = 30 * 60  # 30 分钟缓存（云端改密码后最长 30 分钟内同步生效）
 
-# 文件级密码缓存（仅网络不通时兜底，30 分钟 TTL）
+# 离线 stale 兜底 TTL（3 天）：所有在线通道全部失败时，允许使用 3 天内的文件缓存放行。
+# 与在线 TTL（30 分钟）相互独立——在线路径永远只用 30 分钟 TTL，保证改密码快速生效；
+# 3 天 stale 仅在用户持续离线时兜底，避免"离线超过 30 分钟无法启动"的回归。
+PASSWORD_STALE_CACHE_SECONDS = 3 * 24 * 3600
+
+# 文件级密码缓存（离线兜底：仅网络不通/在线通道全部失败时使用，TTL 与在线缓存一致为 30 分钟）
 def _get_password_cache_path():
     try:
         base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "LiveStreamFetcher")
@@ -12509,11 +12514,22 @@ def _get_password_cache_path():
         return None
 
 
-def _load_password_from_file():
-    """从文件加载缓存的密码（30 分钟 TTL，超出 TTL 视为无效）
-    
+def _load_password_from_file(max_age_seconds: float = None):
+    """从文件加载缓存的密码。
+
+    Args:
+        max_age_seconds: 缓存最大有效时长（秒）。缺省为 PASSWORD_CACHE_SECONDS
+            （30 分钟，在线路径使用，保证云端改密码 30 分钟内生效）；
+            离线兜底路径传 PASSWORD_STALE_CACHE_SECONDS（3 天），
+            仅在所有在线通道全部失败时使用。
+
     文件格式：<unix_timestamp>\n<password>
+
+    Returns:
+        (password, timestamp)；无缓存或超出 max_age_seconds 返回 ("", 0)
     """
+    if max_age_seconds is None:
+        max_age_seconds = PASSWORD_CACHE_SECONDS
     path = _get_password_cache_path()
     if not path or not os.path.exists(path):
         return "", 0
@@ -12524,7 +12540,7 @@ def _load_password_from_file():
             ts = float(lines[0])
             pwd = lines[1]
             elapsed = time.time() - ts
-            if elapsed < PASSWORD_CACHE_SECONDS:
+            if elapsed < max_age_seconds:
                 return pwd, ts
             else:
                 # 过期，不返回
@@ -12558,8 +12574,56 @@ def _log_password_debug(msg: str):
         pass
 
 
+def _try_offline_stale_fallback():
+    """离线终极兜底：30 分钟文件缓存也失效时，放宽到 3 天 stale 缓存。
+
+    仅在所有在线通道（内存缓存/urllib/Playwright）与 30 分钟文件缓存全部失败后
+    调用。命中说明用户持续离线，使用最近一次成功拉取的旧密码放行，
+    并在 diag 中提示缓存时间。不影响在线改密码的生效速度（在线路径不会走到这里）。
+
+    Returns:
+        (password, diag_msg)；stale 缓存也不可用时返回 ("", "")
+    """
+    global _cached_password, _cached_password_time
+    cached, ts = _load_password_from_file(max_age_seconds=PASSWORD_STALE_CACHE_SECONDS)
+    if cached:
+        _cached_password = cached
+        _cached_password_time = ts
+        hours = (time.time() - ts) / 3600
+        _log_password_debug(f"offline stale fallback hit, cached {hours:.1f}h ago")
+        return cached, f"离线模式（缓存于 {hours:.1f} 小时前）"
+    return "", ""
+
+
+# 零宽/不可见字符（语雀等富文本渲染常夹带，str.strip() 无法去除）
+_INVISIBLE_CHARS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad]")
+
+
+def _sanitize_password_candidate(line: str) -> str:
+    """剔除零宽/不可见字符并 strip，得到干净的候选行。"""
+    if not line:
+        return ""
+    return _INVISIBLE_CHARS_RE.sub("", line).strip()
+
+
+def _is_valid_password(pwd: str) -> bool:
+    """校验密码候选：净化后非空且至少含 1 个可见字母或数字。
+
+    防止零宽字符/纯符号等脏数据被当成密码写入缓存（污染后 30 分钟内无法自恢复）。
+    """
+    if not pwd:
+        return False
+    cleaned = _sanitize_password_candidate(pwd)
+    return bool(cleaned) and any(ch.isalnum() for ch in cleaned)
+
+
 def _extract_password_from_text(text: str) -> str:
-    """从语雀文档的文本中提取密码（多种策略）。"""
+    """从语雀文档的文本中提取密码（多种策略）。
+
+    所有候选行先经 _sanitize_password_candidate 净化（去零宽字符），
+    并要求结果至少含 1 个可见字母或数字——避免 '\\u200b' 之类不可见
+    字符被误判为最短密码行。
+    """
     if not text:
         return ""
 
@@ -12575,33 +12639,48 @@ def _extract_password_from_text(text: str) -> str:
     lines = text.split("\n")
     clean_lines = []
     for line in lines:
-        c = line.strip()
+        c = _sanitize_password_candidate(line)
         if c and len(c) < 500:
             clean_lines.append(c)
 
-    # 策略 1：找到包含"密码"关键词的行，取下一行的值或同行后半段
+    def _next_valid_line(start: int) -> str:
+        """取 start 之后第一个非 skip、净化后非空且含可见字母/数字的行。"""
+        for j in range(start + 1, len(clean_lines)):
+            v = clean_lines[j]
+            if (v and len(v) < 100 and _is_valid_password(v)
+                    and not any(sw in v for sw in skip_words)):
+                return v
+        return ""
+
+    # 策略 1：找到包含"密码"关键词的行，取同行后半段；取不到则回退取其后的有效行
     for i, cl in enumerate(clean_lines):
         if any(kw in cl.lower() for kw in pwd_keywords):
-            # 跳过纯说明文字（如"直播流软件密码"本身）
+            # 跳过纯说明文字（如"直播流软件密码"本身）→ 直接取下一有效行
             if any(sw == cl for sw in skip_words):
-                if i + 1 < len(clean_lines):
-                    next_val = clean_lines[i + 1].strip()
-                    if next_val and not any(sw in next_val for sw in skip_words):
-                        return next_val
+                nxt = _next_valid_line(i)
+                if nxt:
+                    return nxt
+                continue
             # 如果这行格式是 "密码：xxx" 或 "密码 xxx"
             for kw in pwd_keywords:
                 if kw in cl.lower():
                     parts = cl.split(kw)
                     if len(parts) >= 2:
-                        val = parts[-1].strip().lstrip("：:：= \t")
-                        if val and len(val) < 100:
+                        val = _sanitize_password_candidate(parts[-1]).lstrip("：:：= \t")
+                        if val and len(val) < 100 and _is_valid_password(val):
                             return val
+            # 同行未取到（如"内部版本直播流软件密码"右段为空）→ 回退取下一有效行
+            nxt = _next_valid_line(i)
+            if nxt:
+                return nxt
 
-    # 策略 2：取所有短行中最短的（密码通常很短）
+    # 策略 2：取所有短行中最短的（密码通常很短；候选已净化且须含可见字母/数字，
+    # 并排除含"密码/口令"等关键词的行——那是标签不是密码，防止把关键词本身当密码返回）
     short_lines = []
     for cl in clean_lines:
         if not any(sw in cl for sw in skip_words):
-            if 1 <= len(cl) <= 30:
+            if (1 <= len(cl) <= 30 and _is_valid_password(cl)
+                    and not any(kw in cl.lower() for kw in pwd_keywords)):
                 short_lines.append(cl)
     if short_lines:
         short_lines.sort(key=len)
@@ -12610,47 +12689,65 @@ def _extract_password_from_text(text: str) -> str:
     return ""
 
 
-def _try_fetch_via_requests(timeout: float = 15) -> str:
+def _try_fetch_via_requests(timeout: float = 15, retries: int = 1) -> str:
     """快速通道：用 urllib 直接请求语雀文档（轻量、不启动浏览器）。
 
     如果文档内容在初始 HTML 中（SSR/搜索引擎可见），就能拿到。
     如果是纯 SPA 则拿不到，调用方需 fallback 到 Playwright。
+
+    慢网络保护：单次超时 15 秒，网络异常时按指数退避重试（首次失败等 1 秒再试），
+    总耗时上限约 30 秒，避免网络抖动被误判为失败。
+    注意：请求成功但提取不到密码（页面结构问题）不重试，直接返回空串。
     """
-    try:
-        import urllib.request
-        import urllib.error
+    import urllib.request
+    import urllib.error
+    import re
+    import html as html_mod
 
-        req = urllib.request.Request(
-            PASSWORD_DOC_URL,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                              "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                PASSWORD_DOC_URL,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
 
-        # 尝试从 HTML 中提取文本（粗略去标签）
-        import re
-        # 移除 script/style
-        html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-        # 替换块级标签为换行
-        html = re.sub(r"</?(div|p|br|h\d|li|tr|td)[^>]*>", "\n", html, flags=re.IGNORECASE)
-        # 去标签
-        text = re.sub(r"<[^>]+>", " ", html)
-        # 解码 HTML 实体
-        import html as html_mod
-        text = html_mod.unescape(text)
-        # 合并多余空白
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n", text)
+            # 尝试从 HTML 中提取文本（粗略去标签）
+            # 移除 script/style
+            html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+            # 替换块级标签为换行
+            html = re.sub(r"</?(div|p|br|h\d|li|tr|td)[^>]*>", "\n", html, flags=re.IGNORECASE)
+            # 去标签
+            text = re.sub(r"<[^>]+>", " ", html)
+            # 解码 HTML 实体
+            text = html_mod.unescape(text)
+            # 合并多余空白
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n\s*\n+", "\n", text)
 
-        return _extract_password_from_text(text)
-    except Exception:
-        return ""
+            # 请求成功但提取不到密码属于页面结构问题，重试无意义，直接返回
+            return _extract_password_from_text(text)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                _log_password_debug(
+                    f"urllib attempt {attempt + 1} failed ({type(e).__name__}), retry in 1s"
+                )
+                time.sleep(1 * (2 ** attempt))  # 指数退避：第 1 次失败后等 1 秒
+
+    _log_password_debug(
+        f"urllib channel failed after {retries + 1} attempts: "
+        f"{type(last_error).__name__}: {last_error}"
+    )
+    return ""
 
 
 def _fetch_password_from_doc(timeout: float = 60) -> tuple:
@@ -12658,9 +12755,11 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
 
     策略链（按优先级）：
     1️⃣ 内存缓存（30 分钟，最快）
-    2️⃣ urllib 快速通道（12 秒，在线获取最新密码）
+    2️⃣ urllib 快速通道（单次 15 秒，失败按指数退避重试 1 次，总上限约 30 秒，在线获取最新密码）
     3️⃣ Playwright 浏览器（60 秒，处理 SPA 页面）
-    4️⃣ 文件缓存（30 分钟 TTL，仅前 3 步全部失败时使用）
+    4️⃣ 文件缓存（30 分钟 TTL，离线兜底，仅前 3 步全部失败时使用）
+    5️⃣ 离线 stale 缓存（3 天 TTL，终极兜底，仅前 4 步全部失败时使用，
+       防止持续离线用户无法启动；不影响在线改密码 30 分钟内生效）
 
     关键设计：永远先在线获取 → 保证云端改密码后软件立即生效。
     文件缓存仅在网络不通时兜底使用。
@@ -12679,9 +12778,13 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
         _log_password_debug("使用内存缓存（30分内不重复请求）")
         return _cached_password, "（30分钟内已验证）"
 
-    # ─── 2️⃣ 快速通道：urllib 直接请求（不启动浏览器，10秒搞定） ───
+    # ─── 2️⃣ 快速通道：urllib 直接请求（不启动浏览器，单次 15 秒 + 退避重试 1 次） ───
     _log_password_debug("尝试 urllib 快速通道...")
-    req_pwd = _try_fetch_via_requests(timeout=10)
+    req_pwd = _try_fetch_via_requests(timeout=15)
+    # 写入缓存前校验：防止零宽字符等脏数据污染内存/文件缓存
+    if req_pwd and not _is_valid_password(req_pwd):
+        _log_password_debug("urllib result rejected by sanity check (invisible chars?)")
+        req_pwd = ""
     if req_pwd:
         _cached_password = req_pwd
         _cached_password_time = now
@@ -12851,13 +12954,14 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
             diag_holder[0] = f"Playwright 异常: {type(e).__name__}: {e}"
             _log_password_debug(diag_holder[0])
 
-    # 启动线程并等待结果（带超时）
+    # 启动线程并等待结果（带超时；看门狗在 timeout 基础上多留 15 秒余量，
+    # 避免浏览器关闭/清理阶段的收尾耗时被误判为超时）
     fetch_thread = threading.Thread(target=_do_fetch, daemon=True)
     fetch_thread.start()
-    fetch_thread.join(timeout=timeout)
+    fetch_thread.join(timeout=timeout + 15)
 
     if fetch_thread.is_alive():
-        diag_holder[0] = f"浏览器超时（{int(timeout)}秒），尝试文件缓存兜底"
+        diag_holder[0] = f"浏览器超时（{int(timeout + 15)}秒），尝试文件缓存兜底"
         _log_password_debug(diag_holder[0])
         if _popen_patched:
             subprocess.Popen = _orig_popen
@@ -12868,12 +12972,21 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
             _cached_password_time = ts
             _log_password_debug("Playwright 超时，使用文件缓存兜底")
             return cached, "离线模式（使用文件缓存）"
+        # 5️⃣ 终极兜底：3 天 stale 缓存（持续离线场景放行）
+        stale_pwd, stale_diag = _try_offline_stale_fallback()
+        if stale_pwd:
+            return stale_pwd, stale_diag
         return "", diag_holder[0]
 
     if error_holder[0]:
         _log_password_debug(f"获取密码失败: {error_holder[0]}")
 
     password = result_holder[0].strip()
+    # 写入缓存前校验：脏数据（如零宽字符）视为抓取失败，继续走文件缓存兜底
+    if password and not _is_valid_password(password):
+        _log_password_debug("playwright result rejected by sanity check (invisible chars?)")
+        diag_holder[0] = diag_holder[0] if diag_holder[0] != "未知原因" else "提取结果未通过有效性校验"
+        password = ""
     if password:
         _cached_password = password
         _cached_password_time = now
@@ -12890,6 +13003,10 @@ def _fetch_password_from_doc(timeout: float = 60) -> tuple:
             _cached_password_time = ts
             _log_password_debug("Playwright 失败，使用文件缓存兜底")
             return cached, f"离线模式（{diag_msg[:30]}…，使用缓存兜底）"
+        # ─── 5️⃣ 终极兜底：3 天 stale 缓存（持续离线场景放行） ───
+        stale_pwd, stale_diag = _try_offline_stale_fallback()
+        if stale_pwd:
+            return stale_pwd, stale_diag
         _log_password_debug("所有通道均失败，无可用密码")
 
     if _popen_patched:
